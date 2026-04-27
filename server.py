@@ -257,7 +257,9 @@ td.code{font-family:Consolas,monospace}
 .badge.active{background:#0f3460;color:#4fc3f7}
 .badge.unused{background:#2a2a4e;color:#a0a0c0}
 .badge.disabled{background:#5a1f2e;color:#ff8899}
-.badge.expired{background:#4a3800;color:#ffcc66}
+.badge.online{background:#0d3320;color:#2ecc71}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#2ecc71;margin-right:4px;animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
 .login{max-width:400px;margin:100px auto;background:#16213e;padding:30px;border-radius:8px}
 .login input{width:100%;margin-bottom:10px}
 .login button{width:100%}
@@ -335,16 +337,22 @@ function fmt(i){if(!i)return'-';return new Date(i).toLocaleString();}
 function fmtD(i){if(!i)return'-';return new Date(i).toLocaleDateString();}
 function hrs(s){return s?(s/3600).toFixed(1)+'h':'-';}
 function trunc(s){if(!s)return'';return s.length>14?s.slice(0,14)+'...':s;}
+function isOnline(last_seen){ if(!last_seen) return false; return (new Date()-new Date(last_seen)) < 2*60*1000; }
 function isExp(i){if(!i)return false;return new Date(i)<new Date();}
 function render(d){
  document.getElementById('version').textContent='Server v'+(d.current_version||'?');
- const c=d.codes;document.getElementById('status').textContent=c.length+' total, '+c.filter(x=>x.hwid).length+' active';
+ const c=d.codes;
+ const onlineCount = c.filter(x=>isOnline(x.last_seen)).length;
+ document.getElementById('status').textContent=c.length+' total, '+c.filter(x=>x.hwid).length+' active, '+(onlineCount?'<span style="color:#2ecc71">●</span> '+onlineCount+' online now':'0 online');
+ document.getElementById('status').innerHTML=c.length+' total &nbsp;|&nbsp; '+c.filter(x=>x.hwid).length+' activated &nbsp;|&nbsp; <span style="color:#2ecc71">● '+onlineCount+' online now</span>';
  document.getElementById('tbody').innerHTML=c.map(x=>{
   let st='UNUSED',cl='unused';
   if(x.disabled){st='DISABLED';cl='disabled';}
   else if(x.expires_at&&isExp(x.expires_at)){st='EXPIRED';cl='expired';}
   else if(x.hwid){st='ACTIVE';cl='active';}
-  return'<tr><td><span class="badge '+cl+'">'+st+'</span></td>'+
+  const online = isOnline(x.last_seen);
+  return'<tr style="'+(online?'background:rgba(46,204,113,0.04)':'')+'">'
+   +'<td><span class="badge '+cl+'">'+st+'</span>'+(online?' <span class="dot"></span>':'')+' </td>'+
    '<td class="code">'+x.code+' <span class="copy" onclick="copy(\\''+x.code+'\\')">copy</span>'+(x.note?'<br><span class="mini">'+x.note+'</span>':'')+'</td>'+
    '<td class="mini">'+(x.hwid?trunc(x.hwid):'-')+'</td>'+
    '<td class="mini"><a href="#" onclick="setExpiry(\\''+x.code+'\\');return false">'+fmtD(x.expires_at)+'</a></td>'+
@@ -356,6 +364,8 @@ function render(d){
  }).join('');
 }
 document.getElementById('key').addEventListener('keypress',e=>{if(e.key==='Enter')login();});
+// Auto-refresh every 30s to keep online status current
+setInterval(()=>{ if(document.getElementById('panel').style.display!=='none' && !document.getElementById('panel').classList.contains('hide')) load(); }, 30000);
 </script></body></html>"""
 
 @app.get("/admin")
@@ -364,4 +374,3 @@ def admin_page():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
