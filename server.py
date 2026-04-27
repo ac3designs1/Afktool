@@ -291,8 +291,9 @@ td.code{font-family:Consolas,monospace}
  <div class='card'>
   <h3>Broadcast message to all users (leave empty to clear)</h3>
   <div class='bar'>
-   <input id='bmsg' type='text' placeholder='Server maintenance 3pm EST' style='flex:1'>
+   <input id='bmsg' type='text' placeholder='Announcement text...' style='flex:1'>
    <button onclick='setBroadcast()'>Send</button>
+   <button class='ghost' onclick='clearBroadcast()'>Clear</button>
    <button class='ghost' onclick='sendToAll()'>📩 Message All Active</button>
   </div>
  </div>
@@ -314,7 +315,8 @@ async function disable(c,on){await api('/disable',{admin_key:KEY,code:c,disabled
 async function revoke(c){if(!confirm('Delete '+c+'?'))return;await api('/revoke',{admin_key:KEY,code:c});toast('Revoked');load();}
 async function reset(c){if(!confirm('Unbind HWID from '+c+'?'))return;await api('/reset',{admin_key:KEY,code:c});toast('Reset');load();}
 async function setExpiry(c){const d=prompt('Days until expiry (empty=lifetime):');if(d===null)return;await api('/set_expiry',{admin_key:KEY,code:c,days:d||null});toast('Updated');load();}
-async function setBroadcast(){const m=document.getElementById('bmsg').value;await api('/broadcast',{admin_key:KEY,message:m});toast(m?'Sent':'Cleared');document.getElementById('bmsg').value='';}
+async function setBroadcast(){const m=document.getElementById('bmsg').value;await api('/broadcast',{admin_key:KEY,message:m});toast(m?'Broadcast sent':'Broadcast cleared');document.getElementById('bmsg').value='';}
+async function clearBroadcast(){await api('/broadcast',{admin_key:KEY,message:''});toast('Broadcast cleared');document.getElementById('bmsg').value='';}
 async function sendToAll(){
  const m=prompt('Message to ALL active users (online in last 10 min):');
  if(!m||!m.trim())return;
@@ -362,3 +364,4 @@ def admin_page():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
