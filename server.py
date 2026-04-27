@@ -339,9 +339,18 @@ function hrs(s){return s?(s/3600).toFixed(1)+'h':'-';}
 function trunc(s){if(!s)return'';return s.length>14?s.slice(0,14)+'...':s;}
 function isOnline(last_seen){ 
   if(!last_seen) return false; 
-  // Append Z so JS parses as UTC, not local time
   const t = new Date(last_seen.includes('Z') ? last_seen : last_seen + 'Z');
-  return (new Date() - t) < 2*60*1000; 
+  return (new Date() - t) < 5*60*1000; // 5 min window
+}
+function timeAgo(iso){
+  if(!iso) return '-';
+  const t = new Date(iso.includes('Z') ? iso : iso + 'Z');
+  const secs = Math.floor((new Date()-t)/1000);
+  if(secs < 10) return 'just now';
+  if(secs < 60) return secs+'s ago';
+  if(secs < 3600) return Math.floor(secs/60)+'m ago';
+  if(secs < 86400) return Math.floor(secs/3600)+'h ago';
+  return Math.floor(secs/86400)+'d ago';
 }
 function isExp(i){if(!i)return false;return new Date(i)<new Date();}
 function render(d){
@@ -361,7 +370,7 @@ function render(d){
    '<td class="code">'+x.code+' <span class="copy" onclick="copy(\\''+x.code+'\\')">copy</span>'+(x.note?'<br><span class="mini">'+x.note+'</span>':'')+'</td>'+
    '<td class="mini">'+(x.hwid?trunc(x.hwid):'-')+'</td>'+
    '<td class="mini"><a href="#" onclick="setExpiry(\\''+x.code+'\\');return false">'+fmtD(x.expires_at)+'</a></td>'+
-   '<td>'+hrs(x.total_seconds)+'</td><td class="mini">'+fmt(x.last_seen)+'</td><td class="mini">'+(x.app_version||'-')+'</td>'+
+   '<td>'+hrs(x.total_seconds)+'</td><td class="mini" title="'+fmt(x.last_seen)+'">'+timeAgo(x.last_seen)+'</td><td class="mini">'+(x.app_version||'-')+'</td>'+
    '<td>'+(x.disabled?'<button class="ghost" onclick="disable(\\''+x.code+'\\',false)">Enable</button>':'<button class="ghost" onclick="disable(\\''+x.code+'\\',true)">Disable</button>')+' '+
    (x.hwid?'<button class="ghost" onclick="reset(\\''+x.code+'\\')">Reset</button> ':'')+
    (x.hwid?'<button class="ghost" onclick="sendDM(\\''+x.hwid+'\\',\\''+( x.note||'')+'\\')" style="background:#1a3a5c">📩 DM</button> ':'')+
