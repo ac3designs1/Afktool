@@ -172,6 +172,28 @@ def reset_hwid():
     conn.close()
     return jsonify(ok=True)
 
+@app.post("/send_to_all")
+def send_to_all():
+    """Send a message to all currently active users (seen in last 10 minutes)."""
+    data = request.json or {}
+    if not _auth(data): return jsonify(ok=False), 401
+    message = (data.get("message") or "").strip()
+    if not message: return jsonify(ok=False, error="missing message"), 400
+    conn, cur = db()
+    # Active = has hwid and was seen in last 10 minutes
+    from datetime import timezone
+    cutoff = (datetime.utcnow().replace(tzinfo=timezone.utc)
+              .replace(tzinfo=None) - timedelta(minutes=10)).isoformat()
+    cur.execute("SELECT hwid FROM licenses WHERE hwid IS NOT NULL AND last_seen > %s", (cutoff,))
+    rows = cur.fetchall()
+    count = 0
+    for row in rows:
+        cur.execute("INSERT INTO user_messages(hwid, message, created_at) VALUES(%s,%s,%s)",
+                    (row["hwid"], message, datetime.utcnow().isoformat()))
+        count += 1
+    conn.close()
+    return jsonify(ok=True, sent=count)
+
 @app.post("/send_to_user")
 def send_to_user():
     data = request.json or {}
@@ -271,6 +293,7 @@ td.code{font-family:Consolas,monospace}
   <div class='bar'>
    <input id='bmsg' type='text' placeholder='Server maintenance 3pm EST' style='flex:1'>
    <button onclick='setBroadcast()'>Send</button>
+   <button class='ghost' onclick='sendToAll()'>📩 Message All Active</button>
   </div>
  </div>
  <table>
@@ -292,7 +315,14 @@ async function revoke(c){if(!confirm('Delete '+c+'?'))return;await api('/revoke'
 async function reset(c){if(!confirm('Unbind HWID from '+c+'?'))return;await api('/reset',{admin_key:KEY,code:c});toast('Reset');load();}
 async function setExpiry(c){const d=prompt('Days until expiry (empty=lifetime):');if(d===null)return;await api('/set_expiry',{admin_key:KEY,code:c,days:d||null});toast('Updated');load();}
 async function setBroadcast(){const m=document.getElementById('bmsg').value;await api('/broadcast',{admin_key:KEY,message:m});toast(m?'Sent':'Cleared');document.getElementById('bmsg').value='';}
-async function sendDM(hwid, note){
+async function sendToAll(){
+ const m=prompt('Message to ALL active users (online in last 10 min):');
+ if(!m||!m.trim())return;
+ if(!confirm('Send to all active users?'))return;
+ const r=await api('/send_to_all',{admin_key:KEY,message:m.trim()});
+ if(r.ok) toast('Sent to '+r.sent+' active user(s)');
+ else toast('Failed: '+(r.error||'unknown'));
+}async function sendDM(hwid, note){
  const m=prompt('Message to '+(note||hwid.slice(0,8)+'...')+':');
  if(!m||!m.trim())return;
  const r=await api('/send_to_user',{admin_key:KEY,hwid:hwid,message:m.trim()});
