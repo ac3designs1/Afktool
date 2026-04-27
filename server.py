@@ -337,7 +337,12 @@ function fmt(i){if(!i)return'-';return new Date(i).toLocaleString();}
 function fmtD(i){if(!i)return'-';return new Date(i).toLocaleDateString();}
 function hrs(s){return s?(s/3600).toFixed(1)+'h':'-';}
 function trunc(s){if(!s)return'';return s.length>14?s.slice(0,14)+'...':s;}
-function isOnline(last_seen){ if(!last_seen) return false; return (new Date()-new Date(last_seen)) < 2*60*1000; }
+function isOnline(last_seen){ 
+  if(!last_seen) return false; 
+  // Append Z so JS parses as UTC, not local time
+  const t = new Date(last_seen.includes('Z') ? last_seen : last_seen + 'Z');
+  return (new Date() - t) < 2*60*1000; 
+}
 function isExp(i){if(!i)return false;return new Date(i)<new Date();}
 function render(d){
  document.getElementById('version').textContent='Server v'+(d.current_version||'?');
