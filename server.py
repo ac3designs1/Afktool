@@ -24,6 +24,9 @@ def db():
     cur.execute("""CREATE TABLE IF NOT EXISTS broadcast (
         id INTEGER PRIMARY KEY CHECK (id=1), message TEXT, updated_at TEXT
     )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS user_messages (
+        id SERIAL PRIMARY KEY, hwid TEXT, message TEXT, created_at TEXT, delivered BOOLEAN DEFAULT FALSE
+    )""")
     return conn, cur
 
 def gen_code():
@@ -84,10 +87,16 @@ def verify():
                 (datetime.utcnow().isoformat(), secs, ver or row.get("app_version"), hwid))
     cur.execute("SELECT message, updated_at FROM broadcast WHERE id=1")
     b = cur.fetchone()
+    # Check for a pending personal message
+    cur.execute("SELECT id, message FROM user_messages WHERE hwid=%s AND delivered=FALSE ORDER BY created_at LIMIT 1", (hwid,))
+    um = cur.fetchone()
+    if um:
+        cur.execute("UPDATE user_messages SET delivered=TRUE WHERE id=%s", (um["id"],))
     conn.close()
     return jsonify(valid=True, expires_at=row.get("expires_at"), note=row.get("note"),
                    current_version=CURRENT_VERSION, download_url=DOWNLOAD_URL or None,
-                   broadcast=dict(b) if b and b.get("message") else None)
+                   broadcast=dict(b) if b and b.get("message") else None,
+                   user_message=um["message"] if um else None)
 
 @app.post("/generate")
 def generate():
@@ -160,6 +169,19 @@ def reset_hwid():
     conn, cur = db()
     cur.execute("UPDATE licenses SET hwid=NULL, activated_at=NULL WHERE code=%s",
                 ((data.get("code") or "").strip().upper(),))
+    conn.close()
+    return jsonify(ok=True)
+
+@app.post("/send_to_user")
+def send_to_user():
+    data = request.json or {}
+    if not _auth(data): return jsonify(ok=False), 401
+    hwid = (data.get("hwid") or "").strip().upper()
+    message = (data.get("message") or "").strip()
+    if not hwid or not message: return jsonify(ok=False, error="missing hwid or message"), 400
+    conn, cur = db()
+    cur.execute("INSERT INTO user_messages(hwid, message, created_at) VALUES(%s,%s,%s)",
+                (hwid, message, datetime.utcnow().isoformat()))
     conn.close()
     return jsonify(ok=True)
 
@@ -270,7 +292,13 @@ async function revoke(c){if(!confirm('Delete '+c+'?'))return;await api('/revoke'
 async function reset(c){if(!confirm('Unbind HWID from '+c+'?'))return;await api('/reset',{admin_key:KEY,code:c});toast('Reset');load();}
 async function setExpiry(c){const d=prompt('Days until expiry (empty=lifetime):');if(d===null)return;await api('/set_expiry',{admin_key:KEY,code:c,days:d||null});toast('Updated');load();}
 async function setBroadcast(){const m=document.getElementById('bmsg').value;await api('/broadcast',{admin_key:KEY,message:m});toast(m?'Sent':'Cleared');document.getElementById('bmsg').value='';}
-function copy(t){navigator.clipboard.writeText(t);toast('Copied: '+t);}
+async function sendDM(hwid, note){
+ const m=prompt('Message to '+(note||hwid.slice(0,8)+'...')+':');
+ if(!m||!m.trim())return;
+ const r=await api('/send_to_user',{admin_key:KEY,hwid:hwid,message:m.trim()});
+ if(r.ok) toast('Sent to '+( note||'user')+' — delivers within 5s');
+ else toast('Failed: '+(r.error||'unknown'));
+}function copy(t){navigator.clipboard.writeText(t);toast('Copied: '+t);}
 function fmt(i){if(!i)return'-';return new Date(i).toLocaleString();}
 function fmtD(i){if(!i)return'-';return new Date(i).toLocaleDateString();}
 function hrs(s){return s?(s/3600).toFixed(1)+'h':'-';}
@@ -291,6 +319,7 @@ function render(d){
    '<td>'+hrs(x.total_seconds)+'</td><td class="mini">'+fmt(x.last_seen)+'</td><td class="mini">'+(x.app_version||'-')+'</td>'+
    '<td>'+(x.disabled?'<button class="ghost" onclick="disable(\\''+x.code+'\\',false)">Enable</button>':'<button class="ghost" onclick="disable(\\''+x.code+'\\',true)">Disable</button>')+' '+
    (x.hwid?'<button class="ghost" onclick="reset(\\''+x.code+'\\')">Reset</button> ':'')+
+   (x.hwid?'<button class="ghost" onclick="sendDM(\\''+x.hwid+'\\',\\''+( x.note||'')+'\\')" style="background:#1a3a5c">📩 DM</button> ':'')+
    '<button class="ghost" onclick="revoke(\\''+x.code+'\\')">Delete</button></td></tr>';
  }).join('');
 }
