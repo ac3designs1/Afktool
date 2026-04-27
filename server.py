@@ -8,6 +8,7 @@ from flask import Flask, request, jsonify, Response
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "CHANGE_ME")
 DB = os.environ.get("DB_PATH", "licenses.db")
 CURRENT_VERSION = os.environ.get("APP_VERSION", "1.0.0")
+DOWNLOAD_URL = os.environ.get("DOWNLOAD_URL", "")
 
 app = Flask(__name__)
 
@@ -95,6 +96,7 @@ def verify():
         "expires_at": row["expires_at"],
         "note": row["note"],
         "current_version": CURRENT_VERSION,
+        "download_url": DOWNLOAD_URL or None,
         "broadcast": dict(b) if b and b["message"] else None,
     }
     return jsonify(resp)
