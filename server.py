@@ -1,8 +1,9 @@
 """
-License Server v2 — PostgreSQL (data persists across restarts)
+License Server v3 — PostgreSQL + Advanced Admin Panel
+Full-featured license management with professional dashboard
 """
 import os, secrets, string, psycopg2, psycopg2.extras
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, Response
 
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "CHANGE_ME")
@@ -90,7 +91,6 @@ def verify():
                 (datetime.utcnow().isoformat(), secs, ver or row.get("app_version"), hwid))
     cur.execute("SELECT message, updated_at FROM broadcast WHERE id=1")
     b = cur.fetchone()
-    # Check for a pending personal message
     cur.execute("SELECT id, message FROM user_messages WHERE hwid=%s AND delivered=FALSE ORDER BY created_at LIMIT 1", (hwid,))
     um = cur.fetchone()
     if um:
@@ -183,10 +183,7 @@ def send_to_all():
     message = (data.get("message") or "").strip()
     if not message: return jsonify(ok=False, error="missing message"), 400
     conn, cur = db()
-    # Active = has hwid and was seen in last 10 minutes
-    from datetime import timezone
-    cutoff = (datetime.utcnow().replace(tzinfo=timezone.utc)
-              .replace(tzinfo=None) - timedelta(minutes=10)).isoformat()
+    cutoff = (datetime.utcnow().replace(tzinfo=timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)).isoformat()
     cur.execute("SELECT hwid FROM licenses WHERE hwid IS NOT NULL AND last_seen > %s", (cutoff,))
     rows = cur.fetchall()
     count = 0
@@ -243,15 +240,11 @@ def admin_stats():
     total_users = cur.fetchone()["total"]
     cur.execute("SELECT COUNT(*) as active FROM licenses WHERE hwid IS NOT NULL AND disabled=0")
     active_users = cur.fetchone()["active"]
-    # Online = seen in last 5 minutes
-    from datetime import timezone
     cutoff = (datetime.utcnow().replace(tzinfo=timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)).isoformat()
     cur.execute("SELECT COUNT(*) as online FROM licenses WHERE hwid IS NOT NULL AND last_seen > %s", (cutoff,))
     online = cur.fetchone()["online"]
-    # Total playtime
     cur.execute("SELECT COALESCE(SUM(total_seconds), 0) as total FROM licenses WHERE hwid IS NOT NULL")
     total_seconds = cur.fetchone()["total"] or 0
-    # Top 5 users by playtime
     cur.execute("SELECT hwid, note, total_seconds, last_seen FROM licenses WHERE hwid IS NOT NULL ORDER BY total_seconds DESC LIMIT 5")
     top_users = [dict(r) for r in cur.fetchall()]
     conn.close()
@@ -277,9 +270,8 @@ def admin_all_users():
     data = request.json or {}
     if not _auth(data): return jsonify(ok=False), 401
     conn, cur = db()
-    status = data.get("status")  # "active", "inactive", "expired", "disabled"
+    status = data.get("status")
     search = (data.get("search") or "").strip().upper()
-
     query = "SELECT * FROM licenses WHERE hwid IS NOT NULL"
     if status == "active":
         query += " AND disabled=0 AND (expires_at IS NULL OR expires_at > NOW()::text)"
@@ -290,10 +282,8 @@ def admin_all_users():
     elif status == "inactive":
         cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
         query += f" AND last_seen < '{cutoff}'"
-
     if search:
         query += f" AND (hwid ILIKE '%{search}%' OR note ILIKE '%{search}%')"
-
     query += " ORDER BY last_seen DESC LIMIT 500"
     cur.execute(query)
     users = [dict(r) for r in cur.fetchall()]
@@ -325,7 +315,6 @@ def admin_user_details(hwid):
     if not user:
         conn.close()
         return jsonify(ok=False, error="User not found"), 404
-    # Get recent activity
     cur.execute("SELECT * FROM activity_logs WHERE hwid=%s ORDER BY created_at DESC LIMIT 50", (hwid,))
     logs = [dict(r) for r in cur.fetchall()]
     conn.close()
@@ -339,7 +328,6 @@ def admin_activity_logs():
     hwid = data.get("hwid")
     event_type = data.get("event_type")
     limit = int(data.get("limit", 100))
-
     conn, cur = db()
     query = "SELECT * FROM activity_logs WHERE 1=1"
     if hwid:
@@ -358,41 +346,28 @@ def admin_system_stats():
     data = request.json or {}
     if not _auth(data): return jsonify(ok=False), 401
     conn, cur = db()
-
-    # User stats
     cur.execute("SELECT COUNT(*) as total FROM licenses WHERE hwid IS NOT NULL")
     total_users = cur.fetchone()["total"]
     cur.execute("SELECT COUNT(*) as active FROM licenses WHERE hwid IS NOT NULL AND disabled=0")
     active_users = cur.fetchone()["active"]
     cur.execute("SELECT COUNT(*) as banned FROM licenses WHERE disabled=1")
     banned = cur.fetchone()["banned"]
-
-    # Online stats
-    from datetime import timezone
     cutoff5m = (datetime.utcnow().replace(tzinfo=timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)).isoformat()
     cur.execute("SELECT COUNT(*) as online FROM licenses WHERE hwid IS NOT NULL AND last_seen > %s", (cutoff5m,))
     online = cur.fetchone()["online"]
-
     cutoff24h = (datetime.utcnow() - timedelta(hours=24)).isoformat()
     cur.execute("SELECT COUNT(*) as active24h FROM licenses WHERE hwid IS NOT NULL AND last_seen > %s", (cutoff24h,))
     active_24h = cur.fetchone()["active24h"]
-
-    # Playtime stats
     cur.execute("SELECT COALESCE(SUM(total_seconds), 0) as total FROM licenses WHERE hwid IS NOT NULL")
     total_seconds = cur.fetchone()["total"] or 0
     cur.execute("SELECT AVG(total_seconds) as avg FROM licenses WHERE hwid IS NOT NULL AND total_seconds > 0")
     avg_seconds = cur.fetchone()["avg"] or 0
-
-    # Version stats
     cur.execute("SELECT app_version, COUNT(*) as count FROM licenses WHERE hwid IS NOT NULL GROUP BY app_version ORDER BY count DESC")
     versions = [dict(r) for r in cur.fetchall()]
-
-    # Code stats
     cur.execute("SELECT COUNT(*) as total FROM licenses")
     total_codes = cur.fetchone()["total"]
     cur.execute("SELECT COUNT(*) as unused FROM licenses WHERE hwid IS NULL")
     unused_codes = cur.fetchone()["unused"]
-
     conn.close()
     return jsonify(ok=True,
         users={"total": total_users, "active": active_users, "online": online, "active_24h": active_24h, "banned": banned},
@@ -401,7 +376,7 @@ def admin_system_stats():
         codes={"total": total_codes, "unused": unused_codes, "used": total_codes - unused_codes}
     )
 
-@app.get("/
+@app.get("/")
 def health():
     return "AntiAFK License Server OK"
 
@@ -440,7 +415,7 @@ th{background:#0f3460;color:#a0a0c0;font-weight:500;text-transform:uppercase;fon
       </div>
       <div class='stat'>
         <div class='stat-label'>Online Now</div>
-        <div class='stat-value' id='onlineUsers'>? -</div>
+        <div class='stat-value' id='onlineUsers'>● -</div>
       </div>
       <div class='stat'>
         <div class='stat-label'>Total Playtime</div>
@@ -455,7 +430,7 @@ th{background:#0f3460;color:#a0a0c0;font-weight:500;text-transform:uppercase;fon
       <tbody id='topUsers'></tbody>
     </table>
   </div>
-  <p style='text-align:center;color:#a0a0c0;font-size:12px'><span class='back' onclick='location.href="/admin"'>? Back to Admin Panel</span></p>
+  <p style='text-align:center;color:#a0a0c0;font-size:12px'><span class='back' onclick='location.href="/admin"'>← Back to Admin Panel</span></p>
 </div>
 <div id='login'>
   <div style='max-width:400px;margin:100px auto;background:#16213e;padding:30px;border-radius:8px'>
@@ -487,7 +462,7 @@ async function load(){
 function render(d){
   document.getElementById('totalUsers').textContent = d.total_users;
   document.getElementById('activeUsers').textContent = d.active_users;
-  document.getElementById('onlineUsers').textContent = '? ' + d.online;
+  document.getElementById('onlineUsers').textContent = '● ' + d.online;
   const hrs = (d.total_seconds / 3600).toFixed(1);
   document.getElementById('totalPlaytime').textContent = hrs + 'h';
   document.getElementById('topUsers').innerHTML = d.top_users.map(u => 
@@ -503,158 +478,415 @@ setInterval(() => { if(document.getElementById('stats').style.display !== 'none'
 
 @app.get("/admin-stats-page")
 def admin_stats_page():
-    """Admin statistics dashboard (requires auth in JS)"""
+    """Admin statistics dashboard"""
     return Response(ADMIN_STATS_HTML, mimetype="text/html")
 
 ADMIN_HTML = """<!doctype html><html><head><meta charset='utf-8'>
-<title>AntiAFK Admin</title><style>
-*{box-sizing:border-box;font-family:-apple-system,Segoe UI,sans-serif}
-body{background:#1a1a2e;color:#fff;margin:0;padding:20px}
-h1{color:#e94560;margin:0 0 16px}
-h3{color:#a0a0c0;margin:16px 0 6px;font-size:11px;text-transform:uppercase}
-input,button,textarea{background:#16213e;color:#fff;border:none;padding:9px 12px;border-radius:4px;font-size:13px}
-input,textarea{font-family:Consolas,monospace}
-button{background:#e94560;cursor:pointer;font-weight:bold}
-button:hover{background:#c73652}
-button.ghost{background:#16213e}
-button.ghost:hover{background:#1f2a4d}
-.card{background:#16213e;padding:14px;border-radius:6px;margin-bottom:14px}
-.bar{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-.status{color:#a0a0c0;font-size:12px;margin-left:auto}
-table{width:100%;border-collapse:collapse;background:#16213e;border-radius:6px;overflow:hidden}
-th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #0f3460;font-size:12px}
-th{background:#0f3460;color:#a0a0c0;font-weight:500;text-transform:uppercase;font-size:10px}
-td.code{font-family:Consolas,monospace}
-.badge{padding:2px 7px;border-radius:10px;font-size:10px;font-weight:bold}
-.badge.active{background:#0f3460;color:#4fc3f7}
-.badge.unused{background:#2a2a4e;color:#a0a0c0}
-.badge.disabled{background:#5a1f2e;color:#ff8899}
-.badge.online{background:#0d3320;color:#2ecc71}
-.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#2ecc71;margin-right:4px;animation:pulse 1.5s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
-.login{max-width:400px;margin:100px auto;background:#16213e;padding:30px;border-radius:8px}
-.login input{width:100%;margin-bottom:10px}
-.login button{width:100%}
-.hide{display:none}
-.toast{position:fixed;bottom:20px;right:20px;background:#0f3460;color:#fff;padding:12px 18px;border-radius:6px;opacity:0;transition:opacity .3s}
-.toast.show{opacity:1}
-.copy{cursor:pointer;color:#4fc3f7;font-size:11px;margin-left:6px}
-.mini{font-size:11px;color:#8b92b3}
+<title>AntiAFK Pro Admin Panel</title><style>
+* {box-sizing:border-box;font-family:-apple-system,Segoe UI,sans-serif}
+body {background:#0a0e27;color:#fff;margin:0;padding:0;min-h:100vh}
+.header {background:#1a1a2e;padding:20px;border-bottom:1px solid #16213e;display:flex;align-items:center;justify-content:space-between}
+.header h1 {margin:0;color:#e94560;font-size:24px}
+.header-right {display:flex;gap:12px;align-items:center}
+.logout {padding:8px 16px;background:#16213e;color:#fff;border:none;border-radius:4px;cursor:pointer}
+.logout:hover {background:#1f2a4d}
+.container {display:flex;min-h:calc(100vh - 70px)}
+.sidebar {width:200px;background:#1a1a2e;padding:20px;border-right:1px solid #16213e;overflow-y:auto}
+.nav-item {padding:12px;background:#16213e;color:#a0a0c0;border-radius:4px;margin-bottom:8px;cursor:pointer;transition:0.2s}
+.nav-item:hover {background:#1f2a4d;color:#fff}
+.nav-item.active {background:#e94560;color:#fff}
+.main {flex:1;padding:24px;overflow-y:auto}
+.tab-content {display:none}
+.tab-content.active {display:block}
+.card {background:#16213e;padding:20px;border-radius:8px;margin-bottom:16px}
+.card h2 {margin-top:0;color:#e94560;font-size:16px;text-transform:uppercase}
+.grid {display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:16px}
+.stat-card {background:#0f3460;padding:16px;border-radius:6px;border-left:3px solid #e94560}
+.stat-label {color:#a0a0c0;font-size:12px;text-transform:uppercase;margin-bottom:8px}
+.stat-value {color:#fff;font-size:28px;font-weight:bold}
+table {width:100%;border-collapse:collapse;background:#0f3460;border-radius:6px;overflow:hidden;margin-top:12px}
+th,td {padding:12px;text-align:left;border-bottom:1px solid #1a3a5c;font-size:12px}
+th {background:#1a3a5c;color:#a0a0c0;font-weight:600;text-transform:uppercase;font-size:10px}
+tr:hover {background:#15445f}
+.badge {display:inline-block;padding:4px 10px;border-radius:20px;font-size:10px;font-weight:bold}
+.badge.active {background:#0d3320;color:#2ecc71}
+.badge.banned {background:#5a1f2e;color:#ff8899}
+.badge.expired {background:#4a3f1f;color:#ffcc00}
+.btn {padding:10px 16px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;transition:0.2s}
+.btn-primary {background:#e94560;color:#fff}
+.btn-primary:hover {background:#c73652}
+.btn-secondary {background:#16213e;color:#a0a0c0}
+.btn-secondary:hover {background:#1f2a4d}
+.search-box {display:flex;gap:8px;margin-bottom:16px}
+.search-box input {flex:1;padding:10px;background:#0f3460;color:#fff;border:1px solid #1a3a5c;border-radius:4px;font-size:12px}
+.filter-tags {display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+.filter-tag {padding:8px 12px;background:#0f3460;color:#4fc3f7;border:1px solid #1a3a5c;border-radius:20px;cursor:pointer;font-size:11px}
+.filter-tag:hover {border-color:#4fc3f7}
+.modal {display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;align-items:center;justify-content:center}
+.modal.show {display:flex}
+.modal-content {background:#1a1a2e;padding:24px;border-radius:8px;max-width:600px;width:90%;max-h:80vh;overflow-y:auto}
+.modal-close {float:right;cursor:pointer;font-size:24px;color:#a0a0c0}
+.toast {position:fixed;bottom:20px;right:20px;background:#0f3460;color:#fff;padding:14px 20px;border-radius:6px;opacity:0;transition:opacity 0.3s;z-index:2000}
+.toast.show {opacity:1}
+.dot {display:inline-block;width:8px;height:8px;border-radius:50%;background:#2ecc71;margin-right:6px;animation:pulse 1.5s infinite}
+@keyframes pulse {0%,100%{opacity:1}50%{opacity:0.3}}
+select {padding:10px;background:#0f3460;color:#fff;border:1px solid #1a3a5c;border-radius:4px;font-size:12px;cursor:pointer}
+input[type='text'],input[type='number'],textarea {padding:10px;background:#0f3460;color:#fff;border:1px solid #1a3a5c;border-radius:4px;font-size:12px}
+input[type='text']::placeholder,textarea::placeholder {color:#4a5568}
+textarea {font-family:Consolas,monospace;resize:vertical}
+.flex {display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+h3 {color:#e94560;margin:16px 0 8px}
+.hide {display:none}
 </style></head><body>
-<div id='login' class='login'>
- <h1>AntiAFK Admin</h1>
- <input id='key' type='password' placeholder='Admin Key' autofocus>
- <button onclick='login()'>Login</button>
-</div>
-<div id='panel' class='hide'>
- <div style='display:flex;align-items:center;margin-bottom:16px'>
-  <h1 style='margin:0;flex:1'>AntiAFK License Admin <span class='mini' id='version'></span></h1>
-  <button class='ghost' onclick="window.open('/admin-stats-page','_blank')" style='background:#1a3a5c;padding:6px 12px;font-size:11px;cursor:pointer'>?? View Stats</button>
- </div>
- <div class='card'>
-  <h3>Generate Codes</h3>
-  <div class='bar'>
-   <input id='qty' type='number' value='1' min='1' max='100' style='width:60px'>
-   <input id='note' type='text' placeholder='note / username' style='flex:1;min-width:140px'>
-   <select id='expires' style='background:#16213e;color:#fff;border:none;padding:8px;border-radius:4px'>
-    <option value=''>lifetime</option><option value='1'>1 day</option><option value='7'>7 days</option>
-    <option value='30'>30 days</option><option value='90'>90 days</option><option value='365'>1 year</option>
-   </select>
-   <button onclick='gen()'>Generate</button>
-   <button class='ghost' onclick='load()'>Refresh</button>
-   <span class='status' id='status'>-</span>
+<div class='header'>
+  <h1>🚀 AntiAFK Pro Admin Panel</h1>
+  <div class='header-right'>
+    <button class='logout' onclick='logout()'>Logout</button>
   </div>
- </div>
- <div class='card'>
-  <h3>Broadcast message to all users (leave empty to clear)</h3>
-  <div class='bar'>
-   <input id='bmsg' type='text' placeholder='Announcement text...' style='flex:1'>
-   <button onclick='setBroadcast()'>Send</button>
-   <button class='ghost' onclick='clearBroadcast()'>Clear</button>
-   <button class='ghost' onclick='sendToAll()'>?? Message All Active</button>
-  </div>
- </div>
- <table>
-  <thead><tr><th>Status</th><th>Code</th><th>Note</th><th>Expires</th><th>Hours</th><th>Last Seen</th><th>Ver</th><th></th></tr></thead>
-  <tbody id='tbody'></tbody>
- </table>
 </div>
+<div class='container'>
+  <div class='sidebar'>
+    <div class='nav-item active' onclick='switchTab("overview")' id='nav-overview'>📊 Overview</div>
+    <div class='nav-item' onclick='switchTab("users")' id='nav-users'>👥 Users</div>
+    <div class='nav-item' onclick='switchTab("logs")' id='nav-logs'>📜 Logs</div>
+    <div class='nav-item' onclick='switchTab("profile")' id='nav-profile'>👤 Profile</div>
+    <div class='nav-item' onclick='switchTab("analytics")' id='nav-analytics'>📈 Analytics</div>
+    <div class='nav-item' onclick='switchTab("codes")' id='nav-codes'>🎟️ Codes</div>
+    <div class='nav-item' onclick='switchTab("messages")' id='nav-messages'>💬 Messages</div>
+    <div class='nav-item' onclick='switchTab("settings")' id='nav-settings'>⚙️ Settings</div>
+  </div>
+  <div class='main'>
+    <!-- OVERVIEW -->
+    <div id='overview-tab' class='tab-content active'>
+      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>📊 System Overview</h2>
+      <div class='grid'>
+        <div class='stat-card'><div class='stat-label'>Total Users</div><div class='stat-value' id='stat-total'>-</div></div>
+        <div class='stat-card'><div class='stat-label'>Active</div><div class='stat-value' id='stat-active'>-</div></div>
+        <div class='stat-card'><div class='stat-label'>Online Now</div><div class='stat-value'><span class='dot'></span><span id='stat-online'>-</span></div></div>
+        <div class='stat-card'><div class='stat-label'>Banned</div><div class='stat-value' id='stat-banned'>-</div></div>
+        <div class='stat-card'><div class='stat-label'>Avg Playtime</div><div class='stat-value' id='stat-avg'>-</div></div>
+        <div class='stat-card'><div class='stat-label'>Total Hours</div><div class='stat-value' id='stat-total-time'>-</div></div>
+      </div>
+      <div class='card'>
+        <h2>Top 10 Users</h2>
+        <table><thead><tr><th>Status</th><th>Username</th><th>Playtime</th><th>Last Seen</th><th>Version</th></tr></thead><tbody id='top-users'></tbody></table>
+      </div>
+    </div>
+
+    <!-- USERS -->
+    <div id='users-tab' class='tab-content'>
+      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>👥 User Management</h2>
+      <div class='search-box'>
+        <input type='text' id='user-search' placeholder='Search HWID or username...'>
+        <button class='btn btn-primary' onclick='loadUsers()'>Search</button>
+      </div>
+      <div class='filter-tags'>
+        <div class='filter-tag' onclick='filterUsers("all")'>All</div>
+        <div class='filter-tag' onclick='filterUsers("active")'>Active</div>
+        <div class='filter-tag' onclick='filterUsers("banned")'>Banned</div>
+        <div class='filter-tag' onclick='filterUsers("expired")'>Expired</div>
+        <div class='filter-tag' onclick='filterUsers("inactive")'>Inactive 24h+</div>
+      </div>
+      <div class='card'>
+        <table><thead><tr><th>Status</th><th>Username</th><th>Playtime</th><th>Last Seen</th><th>Actions</th></tr></thead><tbody id='users-table'></tbody></table>
+      </div>
+    </div>
+
+    <!-- LOGS -->
+    <div id='logs-tab' class='tab-content'>
+      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>📜 Activity Log</h2>
+      <div class='card'>
+        <input type='text' placeholder='Filter by HWID...' id='log-hwid-filter' style='width:100%;margin-bottom:12px'>
+        <select id='log-type-filter' style='width:100%;margin-bottom:12px' onchange='loadLogs()'>
+          <option value=''>All Events</option>
+          <option value='LOGIN'>Login</option>
+          <option value='BAN'>Ban</option>
+          <option value='MESSAGE'>Message</option>
+        </select>
+        <button class='btn btn-primary' style='width:100%' onclick='loadLogs()'>Load Logs</button>
+      </div>
+      <div class='card'>
+        <table><thead><tr><th>Time</th><th>HWID</th><th>Event</th><th>Details</th></tr></thead><tbody id='logs-table'></tbody></table>
+      </div>
+    </div>
+
+    <!-- PROFILE -->
+    <div id='profile-tab' class='tab-content'>
+      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>👤 User Profile</h2>
+      <div class='card'>
+        <input type='text' placeholder='Enter HWID...' id='profile-hwid' style='width:100%;margin-bottom:12px;padding:10px'>
+        <button class='btn btn-primary' style='width:100%' onclick='loadUserProfile()'>Load Profile</button>
+      </div>
+      <div id='profile-content'></div>
+    </div>
+
+    <!-- ANALYTICS -->
+    <div id='analytics-tab' class='tab-content'>
+      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>📈 Analytics</h2>
+      <div class='grid'>
+        <div class='stat-card'><div class='stat-label'>24h Active</div><div class='stat-value' id='stat-24h'>-</div></div>
+        <div class='stat-card'><div class='stat-label'>Churn Rate</div><div class='stat-value' id='stat-churn'>-</div><div style='color:#a0a0c0;font-size:10px'>%</div></div>
+        <div class='stat-card'><div class='stat-label'>Code Usage</div><div class='stat-value' id='stat-code-usage'>-</div><div style='color:#a0a0c0;font-size:10px'>%</div></div>
+      </div>
+      <div class='card'>
+        <h3>Version Distribution</h3>
+        <div id='version-list'></div>
+      </div>
+    </div>
+
+    <!-- CODES -->
+    <div id='codes-tab' class='tab-content'>
+      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>🎟️ License Codes</h2>
+      <div class='card'>
+        <h3>Generate Codes</h3>
+        <div class='flex'>
+          <input type='number' id='code-qty' value='1' min='1' max='100' placeholder='Qty' style='width:80px'>
+          <input type='text' id='code-note' placeholder='Username/Note' style='flex:1;min-width:150px'>
+          <select id='code-expires' style='width:120px'>
+            <option value=''>Lifetime</option><option value='1'>1 Day</option><option value='7'>7 Days</option>
+            <option value='30'>30 Days</option><option value='90'>90 Days</option>
+          </select>
+          <button class='btn btn-primary' onclick='generateCodes()'>Generate</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- MESSAGES -->
+    <div id='messages-tab' class='tab-content'>
+      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>💬 Messages</h2>
+      <div class='card'>
+        <h3>Broadcast</h3>
+        <textarea placeholder='Message...' id='broadcast-msg' style='width:100%;height:80px;margin-bottom:12px'></textarea>
+        <button class='btn btn-primary' style='width:100%' onclick='sendBroadcast()'>Send to All Active</button>
+      </div>
+      <div class='card'>
+        <h3>Direct Message</h3>
+        <div class='flex' style='margin-bottom:12px'>
+          <input type='text' id='dm-hwid' placeholder='HWID' style='flex:1;min-width:150px;'>
+        </div>
+        <textarea placeholder='Message...' id='dm-msg' style='width:100%;height:60px;margin-bottom:12px'></textarea>
+        <button class='btn btn-primary' style='width:100%' onclick='sendDM()'>Send DM</button>
+      </div>
+    </div>
+
+    <!-- SETTINGS -->
+    <div id='settings-tab' class='tab-content'>
+      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>⚙️ Settings</h2>
+      <div class='card'>
+        <h3>Server Information</h3>
+        <table><tr><td style='border:0;background:0;padding:8px 0'>Server Version</td><td style='border:0;background:0;padding:8px 0' id='setting-version'>v1.0.0</td></tr>
+        <tr><td style='border:0;background:0;padding:8px 0'>Database Status</td><td style='border:0;background:0;padding:8px 0'><span style='color:#2ecc71'>● Connected</span></td></tr></table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id='user-modal' class='modal'>
+  <div class='modal-content'>
+    <span class='modal-close' onclick='closeModal()'>&times;</span>
+    <div id='modal-body'></div>
+  </div>
+</div>
+
 <div id='toast' class='toast'></div>
+
 <script>
-let KEY=sessionStorage.getItem('akey')||'';
-if(KEY){document.getElementById('login').classList.add('hide');document.getElementById('panel').classList.remove('hide');load();}
-function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1800);}
-async function api(p,b){const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});return r.json();}
-async function login(){KEY=document.getElementById('key').value;const r=await api('/list',{admin_key:KEY});if(!r.ok){alert('Wrong key');return;}sessionStorage.setItem('akey',KEY);document.getElementById('login').classList.add('hide');document.getElementById('panel').classList.remove('hide');render(r);}
-async function load(){const r=await api('/list',{admin_key:KEY});if(!r.ok){sessionStorage.removeItem('akey');location.reload();return;}render(r);}
-async function gen(){const q=parseInt(document.getElementById('qty').value)||1;const n=document.getElementById('note').value;const e=document.getElementById('expires').value;const r=await api('/generate',{admin_key:KEY,count:q,note:n,expires_days:e||null});if(r.ok){document.getElementById('note').value='';toast('Generated '+r.codes.length);if(r.codes.length===1)copy(r.codes[0]);load();}}
-async function disable(c,on){await api('/disable',{admin_key:KEY,code:c,disabled:on?1:0});toast(on?'Disabled':'Enabled');load();}
-async function revoke(c){if(!confirm('Delete '+c+'?'))return;await api('/revoke',{admin_key:KEY,code:c});toast('Revoked');load();}
-async function reset(c){if(!confirm('Unbind HWID from '+c+'?'))return;await api('/reset',{admin_key:KEY,code:c});toast('Reset');load();}
-async function setExpiry(c){const d=prompt('Days until expiry (empty=lifetime):');if(d===null)return;await api('/set_expiry',{admin_key:KEY,code:c,days:d||null});toast('Updated');load();}
-async function setBroadcast(){const m=document.getElementById('bmsg').value;await api('/broadcast',{admin_key:KEY,message:m});toast(m?'Broadcast sent':'Broadcast cleared');document.getElementById('bmsg').value='';}
-async function clearBroadcast(){await api('/broadcast',{admin_key:KEY,message:''});toast('Broadcast cleared');document.getElementById('bmsg').value='';}
-async function sendToAll(){
- const m=prompt('Message to ALL active users (online in last 10 min):');
- if(!m||!m.trim())return;
- if(!confirm('Send to all active users?'))return;
- const r=await api('/send_to_all',{admin_key:KEY,message:m.trim()});
- if(r.ok) toast('Sent to '+r.sent+' active user(s)');
- else toast('Failed: '+(r.error||'unknown'));
-}async function sendDM(hwid, note){
- const m=prompt('Message to '+(note||hwid.slice(0,8)+'...')+':');
- if(!m||!m.trim())return;
- const r=await api('/send_to_user',{admin_key:KEY,hwid:hwid,message:m.trim()});
- if(r.ok) toast('Sent to '+( note||'user')+' — delivers within 5s');
- else toast('Failed: '+(r.error||'unknown'));
-}function copy(t){navigator.clipboard.writeText(t);toast('Copied: '+t);}
-function fmt(i){if(!i)return'-';return new Date(i).toLocaleString();}
-function fmtD(i){if(!i)return'-';return new Date(i).toLocaleDateString();}
-function hrs(s){return s?(s/3600).toFixed(1)+'h':'-';}
-function trunc(s){if(!s)return'';return s.length>14?s.slice(0,14)+'...':s;}
-function isOnline(last_seen){ 
-  if(!last_seen) return false; 
-  const t = new Date(last_seen.includes('Z') ? last_seen : last_seen + 'Z');
-  return (new Date() - t) < 5*60*1000; // 5 min window
+let KEY = sessionStorage.getItem('akey') || '';
+let currentFilter = 'all';
+
+if (!KEY) {
+  const key = prompt('Enter ADMIN_KEY:');
+  if (key) { KEY = key; sessionStorage.setItem('akey', key); }
+  else { location.href = '/'; return; }
 }
-function timeAgo(iso){
-  if(!iso) return '-';
-  const t = new Date(iso.includes('Z') ? iso : iso + 'Z');
-  const secs = Math.floor((new Date()-t)/1000);
-  if(secs < 10) return 'just now';
-  if(secs < 60) return secs+'s ago';
-  if(secs < 3600) return Math.floor(secs/60)+'m ago';
-  if(secs < 86400) return Math.floor(secs/3600)+'h ago';
-  return Math.floor(secs/86400)+'d ago';
+
+async function api(p, b) {
+  const r = await fetch(p, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(b)});
+  return r.json();
 }
-function isExp(i){if(!i)return false;return new Date(i)<new Date();}
-function render(d){
- document.getElementById('version').textContent='Server v'+(d.current_version||'?');
- const c=d.codes;
- const onlineCount = c.filter(x=>isOnline(x.last_seen)).length;
- document.getElementById('status').textContent=c.length+' total, '+c.filter(x=>x.hwid).length+' active, '+(onlineCount?'<span style="color:#2ecc71">?</span> '+onlineCount+' online now':'0 online');
- document.getElementById('status').innerHTML=c.length+' total &nbsp;|&nbsp; '+c.filter(x=>x.hwid).length+' activated &nbsp;|&nbsp; <span style="color:#2ecc71">? '+onlineCount+' online now</span>';
- document.getElementById('tbody').innerHTML=c.map(x=>{
-  let st='UNUSED',cl='unused';
-  if(x.disabled){st='DISABLED';cl='disabled';}
-  else if(x.expires_at&&isExp(x.expires_at)){st='EXPIRED';cl='expired';}
-  else if(x.hwid){st='ACTIVE';cl='active';}
-  const online = isOnline(x.last_seen);
-  return'<tr style="'+(online?'background:rgba(46,204,113,0.04)':'')+'">'
-   +'<td><span class="badge '+cl+'">'+st+'</span>'+(online?' <span class="dot"></span>':'')+' </td>'+
-   '<td class="code">'+x.code+' <span class="copy" onclick="copy(\\''+x.code+'\\')">copy</span>'+(x.note?'<br><span class="mini">'+x.note+'</span>':'')+'</td>'+
-   '<td class="mini">'+(x.hwid?trunc(x.hwid):'-')+'</td>'+
-   '<td class="mini"><a href="#" onclick="setExpiry(\\''+x.code+'\\');return false">'+fmtD(x.expires_at)+'</a></td>'+
-   '<td>'+hrs(x.total_seconds)+'</td><td class="mini" title="'+fmt(x.last_seen)+'">'+timeAgo(x.last_seen)+'</td><td class="mini">'+(x.app_version||'-')+'</td>'+
-   '<td>'+(x.disabled?'<button class="ghost" onclick="disable(\\''+x.code+'\\',false)">Enable</button>':'<button class="ghost" onclick="disable(\\''+x.code+'\\',true)">Disable</button>')+' '+
-   (x.hwid?'<button class="ghost" onclick="reset(\\''+x.code+'\\')">Reset</button> ':'')+
-   (x.hwid?'<button class="ghost" onclick="sendDM(\\''+x.hwid+'\\',\\''+( x.note||'')+'\\')" style="background:#1a3a5c">?? DM</button> ':'')+
-   '<button class="ghost" onclick="revoke(\\''+x.code+'\\')">Delete</button></td></tr>';
- }).join('');
+
+function toast(m) {
+  const t = document.getElementById('toast');
+  t.textContent = m;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2000);
 }
-document.getElementById('key').addEventListener('keypress',e=>{if(e.key==='Enter')login();});
-// Auto-refresh every 30s to keep online status current
-setInterval(()=>{ if(document.getElementById('panel').style.display!=='none' && !document.getElementById('panel').classList.contains('hide')) load(); }, 30000);
+
+function logout() {
+  sessionStorage.removeItem('akey');
+  location.reload();
+}
+
+function switchTab(tab) {
+  document.querySelectorAll('.tab-content').forEach(e => e.classList.remove('active'));
+  document.getElementById(tab + '-tab').classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(e => e.classList.remove('active'));
+  document.getElementById('nav-' + tab).classList.add('active');
+  if (tab === 'overview') loadOverview();
+  else if (tab === 'users') loadUsers();
+  else if (tab === 'logs') loadLogs();
+  else if (tab === 'analytics') loadAnalytics();
+}
+
+async function loadOverview() {
+  const r = await api('/admin-system-stats', {admin_key: KEY});
+  if (!r.ok) return;
+  document.getElementById('stat-total').textContent = r.users.total;
+  document.getElementById('stat-active').textContent = r.users.active;
+  document.getElementById('stat-online').textContent = r.users.online;
+  document.getElementById('stat-banned').textContent = r.users.banned;
+  document.getElementById('stat-avg').textContent = (r.playtime.avg_seconds / 3600).toFixed(1) + 'h';
+  document.getElementById('stat-total-time').textContent = (r.playtime.total_hours).toFixed(0) + 'h';
+  
+  const topR = await api('/admin-all-users', {admin_key: KEY});
+  if (topR.ok) {
+    let html = '';
+    topR.users.slice(0, 10).forEach(u => {
+      html += '<tr><td><span class="badge ' + (u.disabled ? 'banned' : 'active') + '">' + (u.disabled ? 'BANNED' : 'ACTIVE') + '</span></td>';
+      html += '<td>' + (u.note || 'N/A') + '</td>';
+      html += '<td>' + ((u.total_seconds || 0) / 3600).toFixed(1) + 'h</td>';
+      html += '<td>' + (u.last_seen ? new Date(u.last_seen).toLocaleString() : 'Never') + '</td>';
+      html += '<td>' + (u.app_version || '-') + '</td></tr>';
+    });
+    document.getElementById('top-users').innerHTML = html;
+  }
+}
+
+async function loadUsers() {
+  const search = (document.getElementById('user-search').value || '').toUpperCase();
+  const r = await api('/admin-all-users', {admin_key: KEY, status: currentFilter === 'all' ? null : currentFilter, search});
+  if (!r.ok) return;
+  let html = '';
+  r.users.forEach(u => {
+    html += '<tr>';
+    html += '<td><span class="badge ' + (u.disabled ? 'banned' : 'active') + '">' + (u.disabled ? 'BANNED' : 'ACTIVE') + '</span></td>';
+    html += '<td>' + (u.note || 'N/A') + '</td>';
+    html += '<td>' + ((u.total_seconds || 0) / 3600).toFixed(1) + 'h</td>';
+    html += '<td>' + (u.last_seen ? new Date(u.last_seen).toLocaleString() : 'Never') + '</td>';
+    html += '<td><button class="btn btn-secondary" style="font-size:11px;padding:6px 12px" onclick="viewUserProfile(\'' + u.hwid + '\')">View</button></td>';
+    html += '</tr>';
+  });
+  document.getElementById('users-table').innerHTML = html || '<tr><td colspan="5" style="text-align:center;color:#a0a0c0">No users found</td></tr>';
+}
+
+function filterUsers(f) {
+  currentFilter = f;
+  loadUsers();
+}
+
+async function loadLogs() {
+  const hwid = document.getElementById('log-hwid-filter').value;
+  const type = document.getElementById('log-type-filter').value;
+  const r = await api('/admin-activity-logs', {admin_key: KEY, hwid, event_type: type});
+  if (!r.ok) return;
+  let html = '';
+  r.logs.slice(0, 100).forEach(log => {
+    html += '<tr>';
+    html += '<td>' + (log.created_at ? new Date(log.created_at).toLocaleString() : '-') + '</td>';
+    html += '<td style="font-family:monospace;font-size:10px">' + (log.hwid || '-').substring(0, 16) + '...</td>';
+    html += '<td><span style="color:#4fc3f7">' + log.event_type + '</span></td>';
+    html += '<td>' + (log.details || '-') + '</td></tr>';
+  });
+  document.getElementById('logs-table').innerHTML = html || '<tr><td colspan="4" style="text-align:center;color:#a0a0c0">No logs found</td></tr>';
+}
+
+async function viewUserProfile(hwid) {
+  const r = await api('/admin-user-details/' + hwid, {admin_key: KEY});
+  if (!r.ok) { alert('User not found'); return; }
+  let html = '<h3 style="color:#e94560;margin-top:0">' + (r.user.note || hwid) + '</h3>';
+  html += '<p><strong>HWID:</strong> ' + r.user.hwid + '</p>';
+  html += '<p><strong>Status:</strong> ' + (r.user.disabled ? '<span style="color:#ff8899">BANNED</span>' : '<span style="color:#2ecc71">ACTIVE</span>') + '</p>';
+  html += '<p><strong>Playtime:</strong> ' + ((r.user.total_seconds || 0) / 3600).toFixed(1) + 'h</p>';
+  html += '<p><strong>Last Seen:</strong> ' + (r.user.last_seen ? new Date(r.user.last_seen).toLocaleString() : 'Never') + '</p>';
+  html += '<p><strong>Code:</strong> ' + r.user.code + '</p>';
+  html += '<h4 style="color:#a0a0c0">Activity (Last 50)</h4>';
+  html += '<ul style="list-style:none;padding:0;max-height:300px;overflow-y:auto">';
+  r.activity.forEach(log => {
+    html += '<li style="padding:4px 0;border-bottom:1px solid #1a3a5c;font-size:10px">';
+    html += '<span style="color:#4fc3f7">[' + new Date(log.created_at).toLocaleString() + ']</span> ';
+    html += '<strong>' + log.event_type + '</strong>: ' + (log.details || '-') + '</li>';
+  });
+  html += '</ul>';
+  document.getElementById('modal-body').innerHTML = html;
+  document.getElementById('user-modal').classList.add('show');
+}
+
+function loadUserProfile() {
+  const hwid = document.getElementById('profile-hwid').value;
+  if (!hwid) { toast('Enter HWID'); return; }
+  viewUserProfile(hwid);
+  document.getElementById('profile-hwid').value = '';
+}
+
+function closeModal() {
+  document.getElementById('user-modal').classList.remove('show');
+}
+
+async function loadAnalytics() {
+  const r = await api('/admin-system-stats', {admin_key: KEY});
+  if (!r.ok) return;
+  document.getElementById('stat-24h').textContent = r.users.active_24h;
+  document.getElementById('stat-churn').textContent = ((1 - r.users.online / r.users.active) * 100).toFixed(1);
+  document.getElementById('stat-code-usage').textContent = r.codes.total > 0 ? ((1 - r.codes.unused / r.codes.total) * 100).toFixed(1) : '0';
+  let vhtml = '';
+  r.versions.forEach(v => {
+    vhtml += '<div style="margin:8px 0;padding:8px;background:#0f3460;border-radius:4px">' +
+      '<strong style="color:#4fc3f7">' + v.app_version + '</strong>: ' + v.count + ' users</div>';
+  });
+  document.getElementById('version-list').innerHTML = vhtml;
+}
+
+async function sendBroadcast() {
+  const msg = document.getElementById('broadcast-msg').value;
+  if (!msg) { toast('Enter message'); return; }
+  const r = await api('/send_to_all', {admin_key: KEY, message: msg});
+  if (r.ok) {
+    toast('Sent to ' + r.sent + ' users');
+    document.getElementById('broadcast-msg').value = '';
+  } else {
+    toast('Error: ' + (r.error || 'Unknown'));
+  }
+}
+
+async function sendDM() {
+  const hwid = document.getElementById('dm-hwid').value;
+  const msg = document.getElementById('dm-msg').value;
+  if (!hwid || !msg) { toast('Enter HWID and message'); return; }
+  const r = await api('/send_to_user', {admin_key: KEY, hwid, message: msg});
+  if (r.ok) {
+    toast('Message sent');
+    document.getElementById('dm-hwid').value = '';
+    document.getElementById('dm-msg').value = '';
+  } else {
+    toast('Error: ' + (r.error || 'Unknown'));
+  }
+}
+
+async function generateCodes() {
+  const qty = parseInt(document.getElementById('code-qty').value);
+  const note = document.getElementById('code-note').value;
+  const expires = document.getElementById('code-expires').value;
+  if (qty < 1 || qty > 100) { toast('Qty must be 1-100'); return; }
+  const r = await api('/generate', {admin_key: KEY, count: qty, note, expires_days: expires || null});
+  if (r.ok) {
+    toast('Generated ' + r.codes.length + ' codes');
+    const codes = r.codes.join('\\n');
+    const blob = new Blob([codes], {type:'text/plain'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'codes-' + new Date().getTime() + '.txt';
+    a.click();
+    document.getElementById('code-qty').value = '1';
+    document.getElementById('code-note').value = '';
+  } else {
+    toast('Error: ' + (r.error || 'Unknown'));
+  }
+}
+
+// Load overview on start
+loadOverview();
+setInterval(loadOverview, 30000);
 </script></body></html>"""
 
 @app.get("/admin")
@@ -663,3 +895,4 @@ def admin_page():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
