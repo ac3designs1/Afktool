@@ -1,4 +1,4 @@
 # This file makes the server directory a Python package
 from .server import app
 
-__all__ = ['app']# This file makes the server directory a Python package
+__all__ = ['app']
