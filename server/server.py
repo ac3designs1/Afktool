@@ -456,15 +456,20 @@ def admin_activity_logs():
     limit = min(int(data.get("limit", 100)), 500)
     conn, cur = db()
     try:
-        query = "SELECT * FROM activity_logs WHERE 1=1"
+        query = """
+            SELECT a.*, l.note
+            FROM activity_logs a
+            LEFT JOIN licenses l ON UPPER(l.hwid) = UPPER(a.hwid)
+            WHERE 1=1
+        """
         params = []
         if hwid:
-            query += " AND hwid=%s"
+            query += " AND UPPER(a.hwid)=%s"
             params.append(hwid)
         if event_type:
-            query += " AND event_type=%s"
+            query += " AND a.event_type=%s"
             params.append(event_type)
-        query += " ORDER BY created_at DESC LIMIT %s"
+        query += " ORDER BY a.created_at DESC LIMIT %s"
         params.append(limit)
         cur.execute(query, tuple(params))
         logs = [dict(r) for r in cur.fetchall()]
@@ -685,7 +690,10 @@ textarea{resize:vertical}
       <div class="page-header"><h2>Activity Logs</h2></div>
       <div class="card">
         <div class="input-row">
-          <input type="text" id="log-hwid" placeholder="Filter by HWID..." style="flex:1">
+          <select id="log-user" style="flex:1;min-width:180px">
+            <option value="">All Users</option>
+          </select>
+          <button class="btn btn-ghost btn-sm" id="logs-user-refresh" title="Refresh user list" style="padding:0 10px">↻</button>
           <select id="log-type" style="min-width:180px">
             <option value="">All Events</option>
             <optgroup label="── Session ──">
@@ -694,13 +702,12 @@ textarea{resize:vertical}
               <option value="SESSION_END">Session End</option>
             </optgroup>
             <optgroup label="── In-Game ──">
-              <option value="AFK_TRIGGERED">AFK Triggered</option>
+              <option value="AFK_DETECTED">AFK Detected</option>
+              <option value="AFK_HIT">AFK Hit</option>
               <option value="AFK_LOOP_START">AFK Loop Start</option>
               <option value="AFK_LOOP_STOP">AFK Loop Stop</option>
               <option value="GAME_DETECTED">Game Detected</option>
               <option value="GAME_LOST">Game Lost</option>
-              <option value="CIRCLE_DETECTED">Circle Detected</option>
-              <option value="CIRCLE_MISSED">Circle Missed</option>
             </optgroup>
             <optgroup label="── Access ──">
               <option value="BLOCKED">Blocked</option>
@@ -719,7 +726,7 @@ textarea{resize:vertical}
           <button class="btn btn-primary" id="logs-load-btn">Load Logs</button>
         </div>
         <div class="table-wrap">
-          <table><thead><tr><th>Time</th><th>Username / HWID</th><th>Event</th><th>Details</th></tr></thead>
+          <table><thead><tr><th>Time</th><th>Username</th><th>Event</th><th>Details</th></tr></thead>
           <tbody id="logs-tbody"></tbody></table>
         </div>
       </div>
@@ -924,7 +931,7 @@ function switchTab(name){
   document.querySelector('.nav[data-tab="'+name+'"]').classList.add('active');
   if(name==='overview') loadOverview();
   else if(name==='users') loadUsers();
-  else if(name==='logs') loadLogs();
+  else if(name==='logs'){ populateLogUserDropdown(); loadLogs(); }
   else if(name==='codes') loadCodes();
   else if(name==='messages') loadDMUsers();
   else if(name==='analytics') loadAnalytics();
@@ -997,22 +1004,40 @@ document.getElementById('users-tbody').addEventListener('click',e=>{
 });
 
 // ── Logs ──
+async function populateLogUserDropdown(){
+  const sel=document.getElementById('log-user');
+  const prev=sel.value;
+  sel.innerHTML='<option value="">All Users</option>';
+  const r=await api('/admin-all-users',{admin_key:KEY});
+  if(!r.ok) return;
+  r.users.forEach(u=>{
+    const opt=document.createElement('option');
+    opt.value=u.hwid;
+    const name=u.note||u.hwid.slice(0,14)+'...';
+    opt.textContent=name+(isOnline(u.last_seen)?' 🟢':'');
+    sel.appendChild(opt);
+  });
+  if(prev) sel.value=prev;
+}
 async function loadLogs(){
-  const hwid=document.getElementById('log-hwid').value.trim();
+  const hwid=document.getElementById('log-user').value;
   const event_type=document.getElementById('log-type').value;
   const r=await api('/admin-activity-logs',{admin_key:KEY,hwid:hwid||null,event_type:event_type||null});
   if(!r.ok){ toast('Error loading logs'); return; }
-  document.getElementById('logs-tbody').innerHTML=r.logs.map(l=>
-    '<tr>'
-    +'<td class="muted" style="font-size:11px;white-space:nowrap">'+fmt(l.created_at)+'</td>'
-    +'<td class="mono muted">'+(l.hwid||'—').slice(0,16)+'...</td>'
-    +'<td>'+evBadge(l.event_type)+'</td>'
-    +'<td style="color:#8892b0;font-size:11px">'+(l.details||'—')+'</td>'
-    +'</tr>'
-  ).join('')||empty(4,'No logs found — click Load Logs');
+  document.getElementById('logs-tbody').innerHTML=r.logs.map(l=>{
+    const username=l.note||'<span class="mono muted">'+(l.hwid||'—').slice(0,14)+'...</span>';
+    return '<tr>'
+      +'<td class="muted" style="font-size:11px;white-space:nowrap">'+fmt(l.created_at)+'</td>'
+      +'<td style="font-size:12px">'+username+'</td>'
+      +'<td>'+evBadge(l.event_type)+'</td>'
+      +'<td style="color:#8892b0;font-size:11px">'+(l.details||'—')+'</td>'
+      +'</tr>';
+  }).join('')||empty(4,'No logs found');
 }
 document.getElementById('logs-load-btn').addEventListener('click', loadLogs);
 document.getElementById('log-type').addEventListener('change', loadLogs);
+document.getElementById('log-user').addEventListener('change', loadLogs);
+document.getElementById('logs-user-refresh').addEventListener('click', populateLogUserDropdown);
 
 // ── Codes ──
 async function loadCodes(){
