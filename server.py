@@ -423,7 +423,7 @@ th{background:#0f3460;color:#a0a0c0;font-weight:500;text-transform:uppercase;fon
       </div>
       <div class='stat'>
         <div class='stat-label'>Online Now</div>
-        <div class='stat-value' id='onlineUsers'>? -</div>
+        <div class='stat-value' id='onlineUsers'>● -</div>
       </div>
       <div class='stat'>
         <div class='stat-label'>Total Playtime</div>
@@ -438,7 +438,7 @@ th{background:#0f3460;color:#a0a0c0;font-weight:500;text-transform:uppercase;fon
       <tbody id='topUsers'></tbody>
     </table>
   </div>
-  <p style='text-align:center;color:#a0a0c0;font-size:12px'><span class='back' onclick='location.href="/admin"'>? Back to Admin Panel</span></p>
+  <p style='text-align:center;color:#a0a0c0;font-size:12px'><span class='back' onclick='location.href="/admin"'>← Back to Admin Panel</span></p>
 </div>
 <div id='login'>
   <div style='max-width:400px;margin:100px auto;background:#16213e;padding:30px;border-radius:8px'>
@@ -470,7 +470,7 @@ async function load(){
 function render(d){
   document.getElementById('totalUsers').textContent = d.total_users;
   document.getElementById('activeUsers').textContent = d.active_users;
-  document.getElementById('onlineUsers').textContent = '? ' + d.online;
+  document.getElementById('onlineUsers').textContent = '● ' + d.online;
   const hrs = (d.total_seconds / 3600).toFixed(1);
   document.getElementById('totalPlaytime').textContent = hrs + 'h';
   document.getElementById('topUsers').innerHTML = d.top_users.map(u => 
@@ -547,26 +547,26 @@ h3 {color:#e94560;margin:16px 0 8px}
 .hide {display:none}
 </style></head><body>
 <div class='header'>
-  <h1>?? AntiAFK Pro Admin Panel</h1>
+  <h1>🚀 AntiAFK Pro Admin Panel</h1>
   <div class='header-right'>
     <button class='logout' onclick='logout()'>Logout</button>
   </div>
 </div>
 <div class='container'>
   <div class='sidebar'>
-    <div class='nav-item active' onclick='switchTab("overview")' id='nav-overview'>?? Overview</div>
-    <div class='nav-item' onclick='switchTab("users")' id='nav-users'>?? Users</div>
-    <div class='nav-item' onclick='switchTab("logs")' id='nav-logs'>?? Logs</div>
-    <div class='nav-item' onclick='switchTab("profile")' id='nav-profile'>?? Profile</div>
-    <div class='nav-item' onclick='switchTab("analytics")' id='nav-analytics'>?? Analytics</div>
-    <div class='nav-item' onclick='switchTab("codes")' id='nav-codes'>??? Codes</div>
-    <div class='nav-item' onclick='switchTab("messages")' id='nav-messages'>?? Messages</div>
-    <div class='nav-item' onclick='switchTab("settings")' id='nav-settings'>?? Settings</div>
+    <div class='nav-item active' onclick='switchTab("overview")' id='nav-overview'>📊 Overview</div>
+    <div class='nav-item' onclick='switchTab("users")' id='nav-users'>👥 Users</div>
+    <div class='nav-item' onclick='switchTab("logs")' id='nav-logs'>📜 Logs</div>
+    <div class='nav-item' onclick='switchTab("profile")' id='nav-profile'>👤 Profile</div>
+    <div class='nav-item' onclick='switchTab("analytics")' id='nav-analytics'>📈 Analytics</div>
+    <div class='nav-item' onclick='switchTab("codes")' id='nav-codes'>🎟️ Codes</div>
+    <div class='nav-item' onclick='switchTab("messages")' id='nav-messages'>💬 Messages</div>
+    <div class='nav-item' onclick='switchTab("settings")' id='nav-settings'>⚙️ Settings</div>
   </div>
   <div class='main'>
     <!-- OVERVIEW -->
     <div id='overview-tab' class='tab-content active'>
-      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>?? System Overview</h2>
+      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>📊 System Overview</h2>
       <div class='grid'>
         <div class='stat-card'><div class='stat-label'>Total Users</div><div class='stat-value' id='stat-total'>-</div></div>
         <div class='stat-card'><div class='stat-label'>Active</div><div class='stat-value' id='stat-active'>-</div></div>
@@ -583,7 +583,7 @@ h3 {color:#e94560;margin:16px 0 8px}
 
     <!-- USERS -->
     <div id='users-tab' class='tab-content'>
-      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>?? User Management</h2>
+      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>👥 User Management</h2>
       <div class='search-box'>
         <input type='text' id='user-search' placeholder='Search HWID or username...'>
         <button class='btn btn-primary' onclick='loadUsers()'>Search</button>
@@ -602,7 +602,7 @@ h3 {color:#e94560;margin:16px 0 8px}
 
     <!-- LOGS -->
     <div id='logs-tab' class='tab-content'>
-      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>?? Activity Log</h2>
+      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>📜 Activity Log</h2>
       <div class='card'>
         <input type='text' placeholder='Filter by HWID...' id='log-hwid-filter' style='width:100%;margin-bottom:12px'>
         <select id='log-type-filter' style='width:100%;margin-bottom:12px' onchange='loadLogs()'>
@@ -620,7 +620,7 @@ h3 {color:#e94560;margin:16px 0 8px}
 
     <!-- PROFILE -->
     <div id='profile-tab' class='tab-content'>
-      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>?? User Profile</h2>
+      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>👤 User Profile</h2>
       <div class='card'>
         <input type='text' placeholder='Enter HWID...' id='profile-hwid' style='width:100%;margin-bottom:12px;padding:10px'>
         <button class='btn btn-primary' style='width:100%' onclick='loadUserProfile()'>Load Profile</button>
@@ -630,7 +630,7 @@ h3 {color:#e94560;margin:16px 0 8px}
 
     <!-- ANALYTICS -->
     <div id='analytics-tab' class='tab-content'>
-      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>?? Analytics</h2>
+      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>📈 Analytics</h2>
       <div class='grid'>
         <div class='stat-card'><div class='stat-label'>24h Active</div><div class='stat-value' id='stat-24h'>-</div></div>
         <div class='stat-card'><div class='stat-label'>Churn Rate</div><div class='stat-value' id='stat-churn'>-</div><div style='color:#a0a0c0;font-size:10px'>%</div></div>
@@ -644,7 +644,7 @@ h3 {color:#e94560;margin:16px 0 8px}
 
     <!-- CODES -->
     <div id='codes-tab' class='tab-content'>
-      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>??? License Codes</h2>
+      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>🎟️ License Codes</h2>
       <div class='card'>
         <h3>Generate Codes</h3>
         <div class='flex'>
@@ -661,7 +661,7 @@ h3 {color:#e94560;margin:16px 0 8px}
 
     <!-- MESSAGES -->
     <div id='messages-tab' class='tab-content'>
-      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>?? Messages</h2>
+      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>💬 Messages</h2>
       <div class='card'>
         <h3>Broadcast</h3>
         <textarea placeholder='Message...' id='broadcast-msg' style='width:100%;height:80px;margin-bottom:12px'></textarea>
@@ -679,11 +679,11 @@ h3 {color:#e94560;margin:16px 0 8px}
 
     <!-- SETTINGS -->
     <div id='settings-tab' class='tab-content'>
-      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>?? Settings</h2>
+      <h2 style='color:#e94560;margin:0 0 20px;font-size:20px'>⚙️ Settings</h2>
       <div class='card'>
         <h3>Server Information</h3>
         <table><tr><td style='border:0;background:0;padding:8px 0'>Server Version</td><td style='border:0;background:0;padding:8px 0' id='setting-version'>v1.0.0</td></tr>
-        <tr><td style='border:0;background:0;padding:8px 0'>Database Status</td><td style='border:0;background:0;padding:8px 0'><span style='color:#2ecc71'>? Connected</span></td></tr></table>
+        <tr><td style='border:0;background:0;padding:8px 0'>Database Status</td><td style='border:0;background:0;padding:8px 0'><span style='color:#2ecc71'>● Connected</span></td></tr></table>
       </div>
     </div>
   </div>
@@ -910,10 +910,12 @@ async function generateCodes() {
 
 // Load overview on start
 console.log('Admin panel loaded, fetching data...');
-loadOverview().catch(e => {
+try {
+  loadOverview();
+} catch(e) {
   console.error('Failed to load overview:', e);
   document.getElementById('top-users').innerHTML = '<tr><td colspan="5" style="text-align:center;color:#ff8899">Failed to load data. Check database connection.</td></tr>';
-});
+}
 setInterval(loadOverview, 30000);
 </script></body></html>"""
 
@@ -923,3 +925,4 @@ def admin_page():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
