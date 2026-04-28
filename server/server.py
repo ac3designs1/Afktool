@@ -1353,39 +1353,107 @@ def _start_discord_bot():
         print("[Discord] discord.py not installed — bot disabled")
         return
 
+    # Comma-separated role names that are allowed to use commands, e.g. "Admin,Staff"
+    _allowed_roles = [r.strip().lower() for r in os.environ.get("DISCORD_ADMIN_ROLES", "").split(",") if r.strip()]
+
     intents = discord.Intents.default()
     intents.message_content = True
+    intents.members = True
     bot = dc_commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-    def _check(ctx):
-        """Only respond in the configured channel (or anywhere if not set)."""
+    def _allowed(ctx):
+        """Return True if author is in an allowed role (or no roles configured)."""
+        if not _allowed_roles:
+            return True
+        author_roles = [r.name.lower() for r in getattr(ctx.author, "roles", [])]
+        return any(r in author_roles for r in _allowed_roles)
+
+    def _in_channel(ctx):
         return DISCORD_CHANNEL_ID == 0 or ctx.channel.id == DISCORD_CHANNEL_ID
 
-    @bot.event
-    async def on_ready():
-        print(f"[Discord] Logged in as {bot.user}")
+    async def _guard(ctx):
+        """Returns True and silently passes, or sends an error and returns False."""
+        if not _in_channel(ctx):
+            return False
+        if not _allowed(ctx):
+            await ctx.send("❌ You don't have permission to use this command.", delete_after=5)
+            return False
+        return True
+
+    def _resolve_license(cur, target, mentions):
+        """
+        Resolve a license row from either:
+          - A Discord @mention  → match by note (display name)
+          - A FIVEM-... code    → match by code
+          - A plain name        → match by note
+        Returns (code, row) or (None, None).
+        """
+        if mentions:
+            name = mentions[0].display_name
+            cur.execute("SELECT * FROM licenses WHERE LOWER(note)=LOWER(%s)", (name,))
+        elif target.upper().startswith("FIVEM-"):
+            cur.execute("SELECT * FROM licenses WHERE code=%s", (target.upper(),))
+        else:
+            cur.execute("SELECT * FROM licenses WHERE LOWER(note)=LOWER(%s)", (target,))
+        row = cur.fetchone()
+        if not row:
+            return None, None
+        return row.get("code"), row
+
+    async def _dm_code(discord_user, code, exp_str, note):
+        """Try to DM the discord user their code. Returns True on success."""
+        try:
+            embed = discord.Embed(title="🔑 Your License Code", color=0x2ecc71,
+                description=(
+                    f"Here is your AFK Tool license code:\n\n"
+                    f"```\n{code}\n```\n"
+                    f"**Expiry:** {exp_str}\n\n"
+                    f"Enter this code in the tool to activate it."
+                ))
+            await discord_user.send(embed=embed)
+            return True
+        except Exception:
+            return False
 
     @bot.command(name="help")
     async def cmd_help(ctx):
-        if not _check(ctx): return
-        embed = discord.Embed(title="AFK Tool Bot Commands", color=0x5865F2,
+        if not await _guard(ctx): return
+        roles_note = f"Allowed roles: `{'`, `'.join(_allowed_roles)}`" if _allowed_roles else "No role restriction set"
+        embed = discord.Embed(title="AFK Tool — Bot Commands", color=0x5865F2,
             description=(
-                "`!gen <note> [days]` — Generate a lifetime (or N-day) code\n"
-                "`!trial <note> <hours>` — Generate a trial code (expires from activation)\n"
-                "`!revoke <code>` — Delete a license code\n"
-                "`!ban <code>` — Disable a license\n"
-                "`!unban <code>` — Re-enable a license\n"
-                "`!lookup <code>` — Look up a code's details\n"
-                "`!online` — Show currently online users\n"
-                "`!dm <note_or_hwid> <message>` — Send a message to a user"
+                "**Generating**\n"
+                "`!gen @user [days]` — Generate a code and DM it\n"
+                "`!trial @user <hours>` — Trial code DMed to user\n\n"
+                "**Managing**\n"
+                "`!ban / !unban / !revoke <@user|code|name>`\n"
+                "`!extend <@user|code|name> <days>` — Add days to expiry\n"
+                "`!expire <@user|code|name>` — Instantly expire license\n"
+                "`!resetHWID <@user|code|name>` — Allow new device\n"
+                "`!note <@user|code|name> <new name>` — Rename user\n\n"
+                "**Info**\n"
+                "`!status` — Server snapshot\n"
+                "`!online` — Who's online now\n"
+                "`!inactive [days]` — Users not seen in X days\n"
+                "`!list [page]` — Paginated license list\n"
+                "`!lookup <@user|code|name>` — License details\n"
+                "`!stats <@user|code|name>` — Full user profile\n\n"
+                "**Messaging**\n"
+                "`!msg all <text>` — Broadcast to all online users\n"
+                "`!msg <name> <text>` — In-app DM to one user\n"
+                "`!dm <name> <text>` — Same as above\n\n"
+                f"*{roles_note}*"
             ))
         await ctx.send(embed=embed)
 
     @bot.command(name="gen")
-    async def cmd_gen(ctx, note: str = "discord", days: str = ""):
-        if not _check(ctx): return
-        payload = {"admin_key": ADMIN_KEY, "count": 1, "note": note,
-                   "expires_days": days or None}
+    async def cmd_gen(ctx, target: str = "", days: str = ""):
+        if not await _guard(ctx): return
+        if not target: await ctx.send("Usage: `!gen @user [days]` or `!gen <name> [days]`"); return
+
+        # Resolve mention or plain name
+        mention_user = ctx.message.mentions[0] if ctx.message.mentions else None
+        note = mention_user.display_name if mention_user else target
+
         conn, cur = db()
         try:
             c = gen_code()
@@ -1397,97 +1465,119 @@ def _start_discord_bot():
                         (c, datetime.utcnow().isoformat(), note, expires))
         finally:
             conn.close()
-        exp_str = f"Expires in {days} days" if days else "Lifetime"
+
+        exp_str = f"{days} days" if days else "Lifetime"
+
+        # DM the mentioned user if there was a mention
+        dm_status = ""
+        if mention_user:
+            sent = await _dm_code(mention_user, c, exp_str, note)
+            dm_status = f"\n📩 Code DMed to {mention_user.mention}" if sent else f"\n⚠️ Couldn't DM {mention_user.mention} (DMs may be closed)"
+
         embed = discord.Embed(title="✅ Code Generated", color=0x2ecc71,
-            description=f"**Code:** `{c}`\n**User:** {note}\n**Expiry:** {exp_str}")
+            description=f"**Code:** `{c}`\n**User:** {note}\n**Expiry:** {exp_str}{dm_status}")
         await ctx.send(embed=embed)
 
     @bot.command(name="trial")
-    async def cmd_trial(ctx, note: str = "trial", hours: str = "24"):
-        if not _check(ctx): return
+    async def cmd_trial(ctx, target: str = "", hours: str = "24"):
+        if not await _guard(ctx): return
+        if not target: await ctx.send("Usage: `!trial @user <hours>` or `!trial <name> <hours>`"); return
+
+        mention_user = ctx.message.mentions[0] if ctx.message.mentions else None
+        note = mention_user.display_name if mention_user else target
+        try: h = float(hours)
+        except: h = 24.0
+
         conn, cur = db()
         try:
             c = gen_code()
-            try: h = float(hours)
-            except: h = 24.0
             cur.execute("INSERT INTO licenses(code, created_at, note, trial_hours) VALUES(%s,%s,%s,%s)",
                         (c, datetime.utcnow().isoformat(), note, h))
         finally:
             conn.close()
+
+        exp_str = f"Trial {h}h (starts on activation)"
+        dm_status = ""
+        if mention_user:
+            sent = await _dm_code(mention_user, c, exp_str, note)
+            dm_status = f"\n📩 Code DMed to {mention_user.mention}" if sent else f"\n⚠️ Couldn't DM {mention_user.mention} (DMs may be closed)"
+
         embed = discord.Embed(title="⏱ Trial Code Generated", color=0xf39c12,
-            description=f"**Code:** `{c}`\n**User:** {note}\n**Trial:** {h}h from first activation")
+            description=f"**Code:** `{c}`\n**User:** {note}\n**Trial:** {h}h from first activation{dm_status}")
         await ctx.send(embed=embed)
 
     @bot.command(name="revoke")
-    async def cmd_revoke(ctx, code: str = ""):
-        if not _check(ctx): return
-        if not code: await ctx.send("Usage: `!revoke <CODE>`"); return
+    async def cmd_revoke(ctx, target: str = ""):
+        if not await _guard(ctx): return
+        if not target: await ctx.send("Usage: `!revoke <@user | code | name>`"); return
         conn, cur = db()
         try:
-            cur.execute("SELECT note FROM licenses WHERE code=%s", (code.upper(),))
-            row = cur.fetchone()
-            cur.execute("DELETE FROM licenses WHERE code=%s", (code.upper(),))
+            code, row = _resolve_license(cur, target, ctx.message.mentions)
+            if not row:
+                await ctx.send(f"❌ No license found for `{target}`"); return
+            cur.execute("DELETE FROM licenses WHERE code=%s", (code,))
         finally:
             conn.close()
-        if row:
-            await ctx.send(f"🗑 Revoked `{code.upper()}` ({row.get('note') or '—'})")
-        else:
-            await ctx.send(f"❌ Code `{code.upper()}` not found")
+        await ctx.send(f"🗑 Revoked `{code}` ({row.get('note') or '—'})")
 
     @bot.command(name="ban")
-    async def cmd_ban(ctx, code: str = ""):
-        if not _check(ctx): return
-        if not code: await ctx.send("Usage: `!ban <CODE>`"); return
+    async def cmd_ban(ctx, target: str = ""):
+        if not await _guard(ctx): return
+        if not target: await ctx.send("Usage: `!ban <@user | code | name>`"); return
         conn, cur = db()
         try:
-            cur.execute("UPDATE licenses SET disabled=1 WHERE code=%s", (code.upper(),))
-            cur.execute("SELECT note, hwid FROM licenses WHERE code=%s", (code.upper(),))
-            row = cur.fetchone()
+            code, row = _resolve_license(cur, target, ctx.message.mentions)
+            if not row:
+                await ctx.send(f"❌ No license found for `{target}`"); return
+            cur.execute("UPDATE licenses SET disabled=1 WHERE code=%s", (code,))
         finally:
             conn.close()
-        note = row.get("note") or "—" if row else "—"
-        await ctx.send(f"🚫 Banned `{code.upper()}` ({note})")
+        await ctx.send(f"🚫 Banned `{code}` ({row.get('note') or '—'})")
 
     @bot.command(name="unban")
-    async def cmd_unban(ctx, code: str = ""):
-        if not _check(ctx): return
-        if not code: await ctx.send("Usage: `!unban <CODE>`"); return
+    async def cmd_unban(ctx, target: str = ""):
+        if not await _guard(ctx): return
+        if not target: await ctx.send("Usage: `!unban <@user | code | name>`"); return
         conn, cur = db()
         try:
-            cur.execute("UPDATE licenses SET disabled=0 WHERE code=%s", (code.upper(),))
-            cur.execute("SELECT note FROM licenses WHERE code=%s", (code.upper(),))
-            row = cur.fetchone()
+            code, row = _resolve_license(cur, target, ctx.message.mentions)
+            if not row:
+                await ctx.send(f"❌ No license found for `{target}`"); return
+            cur.execute("UPDATE licenses SET disabled=0 WHERE code=%s", (code,))
         finally:
             conn.close()
-        note = row.get("note") or "—" if row else "—"
-        await ctx.send(f"✅ Unbanned `{code.upper()}` ({note})")
+        await ctx.send(f"✅ Unbanned `{code}` ({row.get('note') or '—'})")
 
     @bot.command(name="lookup")
-    async def cmd_lookup(ctx, code: str = ""):
-        if not _check(ctx): return
-        if not code: await ctx.send("Usage: `!lookup <CODE>`"); return
+    async def cmd_lookup(ctx, target: str = ""):
+        if not await _guard(ctx): return
+        if not target: await ctx.send("Usage: `!lookup <@user | code | name>`"); return
         conn, cur = db()
         try:
-            cur.execute("SELECT * FROM licenses WHERE code=%s", (code.upper(),))
-            row = cur.fetchone()
+            code, row = _resolve_license(cur, target, ctx.message.mentions)
         finally:
             conn.close()
         if not row:
-            await ctx.send(f"❌ Code `{code.upper()}` not found"); return
-        status = "DISABLED" if row["disabled"] else ("EXPIRED" if row.get("expires_at") and datetime.utcnow() > datetime.fromisoformat(row["expires_at"]) else ("ACTIVE" if row["hwid"] else "UNUSED"))
-        embed = discord.Embed(title=f"🔍 {code.upper()}", color=0x4fc3f7,
+            await ctx.send(f"❌ No license found for `{target}`"); return
+        exp = row.get("expires_at")
+        if row["disabled"]:          status = "🚫 DISABLED"
+        elif exp and datetime.utcnow() > datetime.fromisoformat(exp): status = "⌛ EXPIRED"
+        elif row["hwid"]:            status = "✅ ACTIVE"
+        else:                        status = "⬜ UNUSED"
+        trial_line = f"\n**Trial:** {row['trial_hours']}h from activation" if row.get("trial_hours") else ""
+        embed = discord.Embed(title=f"🔍 {row.get('note') or code}", color=0x4fc3f7,
             description=(
                 f"**Status:** {status}\n"
-                f"**User:** {row.get('note') or '—'}\n"
+                f"**Code:** `{code}`\n"
                 f"**HWID:** `{(row.get('hwid') or '—')[:20]}{'...' if row.get('hwid') else ''}`\n"
-                f"**Expires:** {row.get('expires_at') or 'Lifetime'}\n"
+                f"**Expires:** {exp or 'Lifetime'}{trial_line}\n"
                 f"**Hours played:** {round((row.get('total_seconds') or 0)/3600,1)}h"
             ))
         await ctx.send(embed=embed)
 
     @bot.command(name="online")
     async def cmd_online(ctx):
-        if not _check(ctx): return
+        if not await _guard(ctx): return
         conn, cur = db()
         try:
             cutoff = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
@@ -1503,19 +1593,310 @@ def _start_discord_bot():
 
     @bot.command(name="dm")
     async def cmd_dm(ctx, target: str = "", *, message: str = ""):
-        if not _check(ctx): return
-        if not target or not message: await ctx.send("Usage: `!dm <note_or_hwid> <message>`"); return
+        if not await _guard(ctx): return
+        if not target or not message: await ctx.send("Usage: `!dm <name> <message>`"); return
         conn, cur = db()
         try:
             cur.execute("SELECT hwid FROM licenses WHERE LOWER(note)=LOWER(%s) OR hwid=UPPER(%s)", (target, target))
             row = cur.fetchone()
             if not row or not row["hwid"]:
-                await ctx.send(f"❌ User `{target}` not found"); return
+                await ctx.send(f"❌ User `{target}` not found in the license database"); return
             cur.execute("INSERT INTO user_messages(hwid, message, created_at) VALUES(%s,%s,%s)",
                         (row["hwid"], message, datetime.utcnow().isoformat()))
         finally:
             conn.close()
-        await ctx.send(f"📩 Message queued for **{target}**")
+        await ctx.send(f"📩 In-app message queued for **{target}** — delivers within 5s")
+
+    # ── !status ────────────────────────────────────────────────────────────────
+    @bot.command(name="status")
+    async def cmd_status(ctx):
+        if not await _guard(ctx): return
+        conn, cur = db()
+        try:
+            cutoff5  = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+            cutoff24 = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+            cur.execute("SELECT COUNT(*) as v FROM licenses WHERE hwid IS NOT NULL")
+            total = cur.fetchone()["v"]
+            cur.execute("SELECT COUNT(*) as v FROM licenses WHERE last_seen > %s AND hwid IS NOT NULL", (cutoff5,))
+            online = cur.fetchone()["v"]
+            cur.execute("SELECT COUNT(*) as v FROM licenses WHERE hwid IS NULL")
+            unused = cur.fetchone()["v"]
+            cur.execute("SELECT COUNT(*) as v FROM licenses WHERE disabled=1")
+            banned = cur.fetchone()["v"]
+            cur.execute("SELECT COUNT(*) as v FROM licenses WHERE last_seen > %s AND hwid IS NOT NULL", (cutoff24,))
+            active24 = cur.fetchone()["v"]
+            cur.execute("SELECT app_version, COUNT(*) as c FROM licenses WHERE hwid IS NOT NULL AND app_version IS NOT NULL GROUP BY app_version ORDER BY c DESC")
+            versions = cur.fetchall()
+        finally:
+            conn.close()
+        ver_lines = "\n".join(f"  v{r['app_version']}: {r['c']} users" for r in versions) or "  —"
+        embed = discord.Embed(title="📊 Server Status", color=0x5865F2,
+            timestamp=datetime.utcnow())
+        embed.add_field(name="Users", value=f"🟢 **{online}** online\n👥 {total} activated\n⬜ {unused} unused\n🚫 {banned} banned", inline=True)
+        embed.add_field(name="Activity", value=f"📅 {active24} active (24h)\n🕐 {online} active (5m)", inline=True)
+        embed.add_field(name="Versions", value=ver_lines, inline=False)
+        await ctx.send(embed=embed)
+
+    # ── !extend ────────────────────────────────────────────────────────────────
+    @bot.command(name="extend")
+    async def cmd_extend(ctx, target: str = "", days: str = ""):
+        if not await _guard(ctx): return
+        if not target or not days: await ctx.send("Usage: `!extend <@user | code | name> <days>`"); return
+        try: d = float(days)
+        except: await ctx.send("❌ Days must be a number"); return
+        conn, cur = db()
+        try:
+            code, row = _resolve_license(cur, target, ctx.message.mentions)
+            if not row: await ctx.send(f"❌ No license found for `{target}`"); return
+            current = row.get("expires_at")
+            base = max(datetime.fromisoformat(current), datetime.utcnow()) if current else datetime.utcnow()
+            new_exp = (base + timedelta(days=d)).isoformat()
+            cur.execute("UPDATE licenses SET expires_at=%s WHERE code=%s", (new_exp, code))
+        finally:
+            conn.close()
+        name = row.get("note") or code
+        await ctx.send(f"📅 Extended **{name}** by {days} days → expires `{new_exp[:10]}`")
+
+    # ── !note ──────────────────────────────────────────────────────────────────
+    @bot.command(name="note")
+    async def cmd_note(ctx, target: str = "", *, new_note: str = ""):
+        if not await _guard(ctx): return
+        if not target or not new_note: await ctx.send("Usage: `!note <@user | code | name> <new name>`"); return
+        conn, cur = db()
+        try:
+            code, row = _resolve_license(cur, target, ctx.message.mentions)
+            if not row: await ctx.send(f"❌ No license found for `{target}`"); return
+            old_note = row.get("note") or "—"
+            cur.execute("UPDATE licenses SET note=%s WHERE code=%s", (new_note, code))
+        finally:
+            conn.close()
+        await ctx.send(f"✏️ Renamed `{old_note}` → `{new_note}` (`{code}`)")
+
+    # ── !expire ────────────────────────────────────────────────────────────────
+    @bot.command(name="expire")
+    async def cmd_expire(ctx, target: str = ""):
+        if not await _guard(ctx): return
+        if not target: await ctx.send("Usage: `!expire <@user | code | name>`"); return
+        conn, cur = db()
+        try:
+            code, row = _resolve_license(cur, target, ctx.message.mentions)
+            if not row: await ctx.send(f"❌ No license found for `{target}`"); return
+            cur.execute("UPDATE licenses SET expires_at=%s WHERE code=%s",
+                        (datetime.utcnow().isoformat(), code))
+        finally:
+            conn.close()
+        name = row.get("note") or code
+        await ctx.send(f"⌛ Expired **{name}**'s license immediately")
+
+    # ── !resetHWID ─────────────────────────────────────────────────────────────
+    @bot.command(name="resetHWID")
+    async def cmd_reset_hwid(ctx, target: str = ""):
+        if not await _guard(ctx): return
+        if not target: await ctx.send("Usage: `!resetHWID <@user | code | name>`"); return
+        conn, cur = db()
+        try:
+            code, row = _resolve_license(cur, target, ctx.message.mentions)
+            if not row: await ctx.send(f"❌ No license found for `{target}`"); return
+            cur.execute("UPDATE licenses SET hwid=NULL, activated_at=NULL WHERE code=%s", (code,))
+            if row.get("hwid"):
+                cur.execute("DELETE FROM active_sessions WHERE hwid=%s", (row["hwid"],))
+                _log(cur, row["hwid"], "HWID_RESET", f"via discord by {ctx.author.name}", "")
+        finally:
+            conn.close()
+        name = row.get("note") or code
+        await ctx.send(f"🔄 HWID reset for **{name}** — they can activate on a new device")
+
+    # ── !inactive ──────────────────────────────────────────────────────────────
+    @bot.command(name="inactive")
+    async def cmd_inactive(ctx, days: str = "7"):
+        if not await _guard(ctx): return
+        try: d = int(days)
+        except: d = 7
+        conn, cur = db()
+        try:
+            cutoff = (datetime.utcnow() - timedelta(days=d)).isoformat()
+            cur.execute("""SELECT note, hwid, last_seen FROM licenses
+                           WHERE hwid IS NOT NULL AND disabled=0
+                           AND (last_seen IS NULL OR last_seen < %s)
+                           ORDER BY last_seen ASC NULLS FIRST LIMIT 20""", (cutoff,))
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+        if not rows:
+            await ctx.send(f"✅ No inactive users found (>{d} days)"); return
+        lines = []
+        for r in rows:
+            name = r.get("note") or (r["hwid"][:14] + "...")
+            last = r.get("last_seen")
+            ago = f"`{last[:10]}`" if last else "`never`"
+            lines.append(f"• **{name}** — last seen {ago}")
+        embed = discord.Embed(title=f"😴 Inactive Users (>{d} days)", color=0xe67e22,
+            description="\n".join(lines))
+        await ctx.send(embed=embed)
+
+    # ── !list ──────────────────────────────────────────────────────────────────
+    @bot.command(name="list")
+    async def cmd_list(ctx, page: str = "1"):
+        if not await _guard(ctx): return
+        try: page = max(1, int(page))
+        except: page = 1
+        per_page = 15
+        offset = (page - 1) * per_page
+        conn, cur = db()
+        try:
+            cur.execute("SELECT COUNT(*) as v FROM licenses WHERE hwid IS NOT NULL")
+            total = cur.fetchone()["v"]
+            cur.execute("""SELECT note, code, disabled, expires_at, last_seen
+                           FROM licenses WHERE hwid IS NOT NULL
+                           ORDER BY last_seen DESC NULLS LAST
+                           LIMIT %s OFFSET %s""", (per_page, offset))
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+        cutoff = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+        lines = []
+        for r in rows:
+            name = r.get("note") or "—"
+            exp = r.get("expires_at")
+            if r["disabled"]:                        tag = "🚫"
+            elif exp and exp < datetime.utcnow().isoformat(): tag = "⌛"
+            elif r.get("last_seen", "") > cutoff:   tag = "🟢"
+            else:                                    tag = "⚫"
+            lines.append(f"{tag} **{name}**")
+        pages = max(1, (total + per_page - 1) // per_page)
+        embed = discord.Embed(title=f"📋 Active Licenses — Page {page}/{pages}",
+            color=0x4fc3f7, description="\n".join(lines) or "No users")
+        embed.set_footer(text=f"{total} total activated · !list <page>")
+        await ctx.send(embed=embed)
+
+    # ── !stats ─────────────────────────────────────────────────────────────────
+    @bot.command(name="stats")
+    async def cmd_stats(ctx, target: str = ""):
+        if not await _guard(ctx): return
+        if not target: await ctx.send("Usage: `!stats <@user | code | name>`"); return
+        conn, cur = db()
+        try:
+            code, row = _resolve_license(cur, target, ctx.message.mentions)
+            if not row: await ctx.send(f"❌ No license found for `{target}`"); return
+            hwid = row.get("hwid")
+            cur.execute("SELECT COUNT(*) as v FROM activity_logs WHERE hwid=%s AND event_type='SESSION_START'", (hwid,))
+            sessions = cur.fetchone()["v"]
+            cur.execute("SELECT COUNT(*) as v FROM activity_logs WHERE hwid=%s AND event_type='AFK_HIT'", (hwid,))
+            hits = cur.fetchone()["v"]
+            cur.execute("SELECT COUNT(*) as v FROM activity_logs WHERE hwid=%s AND event_type='AFK_DETECTED'", (hwid,))
+            detected = cur.fetchone()["v"]
+        finally:
+            conn.close()
+        name = row.get("note") or code
+        hrs = round((row.get("total_seconds") or 0) / 3600, 1)
+        exp = row.get("expires_at") or "Lifetime"
+        last = (row.get("last_seen") or "never")[:16].replace("T", " ")
+        embed = discord.Embed(title=f"📈 {name}", color=0x2ecc71)
+        embed.add_field(name="Playtime", value=f"{hrs}h", inline=True)
+        embed.add_field(name="Sessions", value=str(sessions), inline=True)
+        embed.add_field(name="Circles Hit", value=str(hits), inline=True)
+        embed.add_field(name="Circles Detected", value=str(detected), inline=True)
+        embed.add_field(name="Last Seen", value=last, inline=True)
+        embed.add_field(name="Expires", value=exp[:10] if exp != "Lifetime" else exp, inline=True)
+        await ctx.send(embed=embed)
+
+    # ── !msg all ───────────────────────────────────────────────────────────────
+    @bot.command(name="msg")
+    async def cmd_msg(ctx, target: str = "", *, message: str = ""):
+        if not await _guard(ctx): return
+        if not target or not message: await ctx.send("Usage: `!msg all <message>` or `!msg <name> <message>`"); return
+        conn, cur = db()
+        try:
+            if target.lower() == "all":
+                cutoff = (datetime.utcnow() - timedelta(minutes=10)).isoformat()
+                cur.execute("SELECT hwid FROM licenses WHERE hwid IS NOT NULL AND last_seen > %s", (cutoff,))
+                rows = cur.fetchall()
+                count = 0
+                for r in rows:
+                    cur.execute("INSERT INTO user_messages(hwid, message, created_at) VALUES(%s,%s,%s)",
+                                (r["hwid"], message, datetime.utcnow().isoformat()))
+                    count += 1
+                await ctx.send(f"📢 Broadcast queued for **{count}** online user(s)")
+            else:
+                cur.execute("SELECT hwid FROM licenses WHERE LOWER(note)=LOWER(%s) OR hwid=UPPER(%s)", (target, target))
+                row = cur.fetchone()
+                if not row or not row["hwid"]:
+                    await ctx.send(f"❌ User `{target}` not found"); return
+                cur.execute("INSERT INTO user_messages(hwid, message, created_at) VALUES(%s,%s,%s)",
+                            (row["hwid"], message, datetime.utcnow().isoformat()))
+                await ctx.send(f"📩 Message queued for **{target}**")
+        finally:
+            conn.close()
+
+    # ── Background tasks ───────────────────────────────────────────────────────
+    @bot.event
+    async def on_ready():
+        print(f"[Discord] Logged in as {bot.user}")
+        if _allowed_roles:
+            print(f"[Discord] Restricted to roles: {', '.join(_allowed_roles)}")
+        expiry_check.start()
+        activation_watch.start()
+
+    import discord.ext.tasks as tasks
+
+    @tasks.loop(hours=24)
+    async def expiry_check():
+        """Post in channel if any licenses expire within 3 days."""
+        if DISCORD_CHANNEL_ID == 0: return
+        ch = bot.get_channel(DISCORD_CHANNEL_ID)
+        if not ch: return
+        conn, cur = db()
+        try:
+            soon  = (datetime.utcnow() + timedelta(days=3)).isoformat()
+            now   = datetime.utcnow().isoformat()
+            cur.execute("""SELECT note, code, expires_at FROM licenses
+                           WHERE expires_at IS NOT NULL AND expires_at > %s AND expires_at < %s
+                           AND disabled=0 AND hwid IS NOT NULL""", (now, soon))
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+        if not rows: return
+        lines = []
+        for r in rows:
+            name = r.get("note") or r["code"]
+            exp  = r["expires_at"][:10]
+            lines.append(f"• **{name}** — expires `{exp}`")
+        embed = discord.Embed(title="⚠️ Licenses Expiring Soon", color=0xf39c12,
+            description="\n".join(lines))
+        await ch.send(embed=embed)
+
+    _last_activation_check = {"ts": datetime.utcnow().isoformat()}
+
+    @tasks.loop(seconds=30)
+    async def activation_watch():
+        """Alert when a new activation happens."""
+        if DISCORD_CHANNEL_ID == 0: return
+        ch = bot.get_channel(DISCORD_CHANNEL_ID)
+        if not ch: return
+        conn, cur = db()
+        try:
+            cur.execute("""SELECT a.details, a.created_at, l.note
+                           FROM activity_logs a
+                           LEFT JOIN licenses l ON UPPER(l.hwid)=UPPER(a.hwid)
+                           WHERE a.event_type='ACTIVATE' AND a.created_at > %s
+                           ORDER BY a.created_at ASC""", (_last_activation_check["ts"],))
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+        for r in rows:
+            _last_activation_check["ts"] = r["created_at"]
+            name = r.get("note") or "Unknown"
+            details = r.get("details") or ""
+            embed = discord.Embed(title="🔑 New Activation", color=0x2ecc71,
+                description=f"**User:** {name}\n**Details:** {details}")
+            await ch.send(embed=embed)
+
+    # ── Update help text ───────────────────────────────────────────────────────
+    @bot.event
+    async def on_command_error(ctx, error):
+        if isinstance(error, dc_commands.CommandNotFound):
+            return
+        await ctx.send(f"❌ Error: {error}", delete_after=8)
 
     asyncio.run(bot.start(DISCORD_BOT_TOKEN))
 
