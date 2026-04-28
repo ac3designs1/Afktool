@@ -27,6 +27,9 @@ def db():
     cur.execute("""CREATE TABLE IF NOT EXISTS user_messages (
         id SERIAL PRIMARY KEY, hwid TEXT, message TEXT, created_at TEXT, delivered BOOLEAN DEFAULT FALSE
     )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS activity_logs (
+        id SERIAL PRIMARY KEY, hwid TEXT, event_type TEXT, details TEXT, created_at TEXT, ip_address TEXT
+    )""")
     return conn, cur
 
 def gen_code():
@@ -268,7 +271,137 @@ def admin_user_stats(hwid):
     if not user: return jsonify(ok=False, error="User not found"), 404
     return jsonify(ok=True, user=dict(user))
 
-@app.get("/")
+@app.post("/admin-all-users")
+def admin_all_users():
+    """Get all users with optional filtering"""
+    data = request.json or {}
+    if not _auth(data): return jsonify(ok=False), 401
+    conn, cur = db()
+    status = data.get("status")  # "active", "inactive", "expired", "disabled"
+    search = (data.get("search") or "").strip().upper()
+
+    query = "SELECT * FROM licenses WHERE hwid IS NOT NULL"
+    if status == "active":
+        query += " AND disabled=0 AND (expires_at IS NULL OR expires_at > NOW()::text)"
+    elif status == "expired":
+        query += " AND expires_at IS NOT NULL AND expires_at <= NOW()::text"
+    elif status == "disabled":
+        query += " AND disabled=1"
+    elif status == "inactive":
+        cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        query += f" AND last_seen < '{cutoff}'"
+
+    if search:
+        query += f" AND (hwid ILIKE '%{search}%' OR note ILIKE '%{search}%')"
+
+    query += " ORDER BY last_seen DESC LIMIT 500"
+    cur.execute(query)
+    users = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return jsonify(ok=True, users=users)
+
+@app.post("/admin-bulk-ban")
+def admin_bulk_ban():
+    """Ban multiple users"""
+    data = request.json or {}
+    if not _auth(data): return jsonify(ok=False), 401
+    hwidlist = data.get("hwidlist", [])
+    if not hwidlist: return jsonify(ok=False, error="no users"), 400
+    conn, cur = db()
+    for hwid in hwidlist:
+        cur.execute("UPDATE licenses SET disabled=1 WHERE hwid=%s", (hwid.upper(),))
+    conn.close()
+    return jsonify(ok=True, banned=len(hwidlist))
+
+@app.post("/admin-user-details/<hwid>")
+def admin_user_details(hwid):
+    """Get comprehensive user profile"""
+    data = request.json or {}
+    if not _auth(data): return jsonify(ok=False), 401
+    hwid = hwid.upper()
+    conn, cur = db()
+    cur.execute("SELECT * FROM licenses WHERE hwid=%s", (hwid,))
+    user = cur.fetchone()
+    if not user:
+        conn.close()
+        return jsonify(ok=False, error="User not found"), 404
+    # Get recent activity
+    cur.execute("SELECT * FROM activity_logs WHERE hwid=%s ORDER BY created_at DESC LIMIT 50", (hwid,))
+    logs = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return jsonify(ok=True, user=dict(user), activity=logs)
+
+@app.post("/admin-activity-logs")
+def admin_activity_logs():
+    """Get activity logs with filtering"""
+    data = request.json or {}
+    if not _auth(data): return jsonify(ok=False), 401
+    hwid = data.get("hwid")
+    event_type = data.get("event_type")
+    limit = int(data.get("limit", 100))
+
+    conn, cur = db()
+    query = "SELECT * FROM activity_logs WHERE 1=1"
+    if hwid:
+        query += f" AND hwid='{hwid.upper()}'"
+    if event_type:
+        query += f" AND event_type='{event_type}'"
+    query += " ORDER BY created_at DESC LIMIT %s"
+    cur.execute(query, (limit,))
+    logs = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return jsonify(ok=True, logs=logs)
+
+@app.post("/admin-system-stats")
+def admin_system_stats():
+    """Get comprehensive system statistics"""
+    data = request.json or {}
+    if not _auth(data): return jsonify(ok=False), 401
+    conn, cur = db()
+
+    # User stats
+    cur.execute("SELECT COUNT(*) as total FROM licenses WHERE hwid IS NOT NULL")
+    total_users = cur.fetchone()["total"]
+    cur.execute("SELECT COUNT(*) as active FROM licenses WHERE hwid IS NOT NULL AND disabled=0")
+    active_users = cur.fetchone()["active"]
+    cur.execute("SELECT COUNT(*) as banned FROM licenses WHERE disabled=1")
+    banned = cur.fetchone()["banned"]
+
+    # Online stats
+    from datetime import timezone
+    cutoff5m = (datetime.utcnow().replace(tzinfo=timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)).isoformat()
+    cur.execute("SELECT COUNT(*) as online FROM licenses WHERE hwid IS NOT NULL AND last_seen > %s", (cutoff5m,))
+    online = cur.fetchone()["online"]
+
+    cutoff24h = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+    cur.execute("SELECT COUNT(*) as active24h FROM licenses WHERE hwid IS NOT NULL AND last_seen > %s", (cutoff24h,))
+    active_24h = cur.fetchone()["active24h"]
+
+    # Playtime stats
+    cur.execute("SELECT COALESCE(SUM(total_seconds), 0) as total FROM licenses WHERE hwid IS NOT NULL")
+    total_seconds = cur.fetchone()["total"] or 0
+    cur.execute("SELECT AVG(total_seconds) as avg FROM licenses WHERE hwid IS NOT NULL AND total_seconds > 0")
+    avg_seconds = cur.fetchone()["avg"] or 0
+
+    # Version stats
+    cur.execute("SELECT app_version, COUNT(*) as count FROM licenses WHERE hwid IS NOT NULL GROUP BY app_version ORDER BY count DESC")
+    versions = [dict(r) for r in cur.fetchall()]
+
+    # Code stats
+    cur.execute("SELECT COUNT(*) as total FROM licenses")
+    total_codes = cur.fetchone()["total"]
+    cur.execute("SELECT COUNT(*) as unused FROM licenses WHERE hwid IS NULL")
+    unused_codes = cur.fetchone()["unused"]
+
+    conn.close()
+    return jsonify(ok=True,
+        users={"total": total_users, "active": active_users, "online": online, "active_24h": active_24h, "banned": banned},
+        playtime={"total_seconds": total_seconds, "avg_seconds": avg_seconds, "total_hours": total_seconds/3600},
+        versions=versions,
+        codes={"total": total_codes, "unused": unused_codes, "used": total_codes - unused_codes}
+    )
+
+@app.get("/
 def health():
     return "AntiAFK License Server OK"
 
@@ -307,7 +440,7 @@ th{background:#0f3460;color:#a0a0c0;font-weight:500;text-transform:uppercase;fon
       </div>
       <div class='stat'>
         <div class='stat-label'>Online Now</div>
-        <div class='stat-value' id='onlineUsers'>● -</div>
+        <div class='stat-value' id='onlineUsers'>? -</div>
       </div>
       <div class='stat'>
         <div class='stat-label'>Total Playtime</div>
@@ -322,7 +455,7 @@ th{background:#0f3460;color:#a0a0c0;font-weight:500;text-transform:uppercase;fon
       <tbody id='topUsers'></tbody>
     </table>
   </div>
-  <p style='text-align:center;color:#a0a0c0;font-size:12px'><span class='back' onclick='location.href="/admin"'>← Back to Admin Panel</span></p>
+  <p style='text-align:center;color:#a0a0c0;font-size:12px'><span class='back' onclick='location.href="/admin"'>? Back to Admin Panel</span></p>
 </div>
 <div id='login'>
   <div style='max-width:400px;margin:100px auto;background:#16213e;padding:30px;border-radius:8px'>
@@ -354,7 +487,7 @@ async function load(){
 function render(d){
   document.getElementById('totalUsers').textContent = d.total_users;
   document.getElementById('activeUsers').textContent = d.active_users;
-  document.getElementById('onlineUsers').textContent = '● ' + d.online;
+  document.getElementById('onlineUsers').textContent = '? ' + d.online;
   const hrs = (d.total_seconds / 3600).toFixed(1);
   document.getElementById('totalPlaytime').textContent = hrs + 'h';
   document.getElementById('topUsers').innerHTML = d.top_users.map(u => 
@@ -414,10 +547,9 @@ td.code{font-family:Consolas,monospace}
  <button onclick='login()'>Login</button>
 </div>
 <div id='panel' class='hide'>
- <h1>AntiAFK License Admin <span class='mini' id='version'></span></h1>
  <div style='display:flex;align-items:center;margin-bottom:16px'>
   <h1 style='margin:0;flex:1'>AntiAFK License Admin <span class='mini' id='version'></span></h1>
-  <button class='ghost' onclick="window.open('/admin-stats-page','_blank')" style='background:#1a3a5c;padding:6px 12px;font-size:11px;cursor:pointer'>📊 View Stats</button>
+  <button class='ghost' onclick="window.open('/admin-stats-page','_blank')" style='background:#1a3a5c;padding:6px 12px;font-size:11px;cursor:pointer'>?? View Stats</button>
  </div>
  <div class='card'>
   <h3>Generate Codes</h3>
@@ -439,7 +571,7 @@ td.code{font-family:Consolas,monospace}
    <input id='bmsg' type='text' placeholder='Announcement text...' style='flex:1'>
    <button onclick='setBroadcast()'>Send</button>
    <button class='ghost' onclick='clearBroadcast()'>Clear</button>
-   <button class='ghost' onclick='sendToAll()'>📩 Message All Active</button>
+   <button class='ghost' onclick='sendToAll()'>?? Message All Active</button>
   </div>
  </div>
  <table>
@@ -500,8 +632,8 @@ function render(d){
  document.getElementById('version').textContent='Server v'+(d.current_version||'?');
  const c=d.codes;
  const onlineCount = c.filter(x=>isOnline(x.last_seen)).length;
- document.getElementById('status').textContent=c.length+' total, '+c.filter(x=>x.hwid).length+' active, '+(onlineCount?'<span style="color:#2ecc71">●</span> '+onlineCount+' online now':'0 online');
- document.getElementById('status').innerHTML=c.length+' total &nbsp;|&nbsp; '+c.filter(x=>x.hwid).length+' activated &nbsp;|&nbsp; <span style="color:#2ecc71">● '+onlineCount+' online now</span>';
+ document.getElementById('status').textContent=c.length+' total, '+c.filter(x=>x.hwid).length+' active, '+(onlineCount?'<span style="color:#2ecc71">?</span> '+onlineCount+' online now':'0 online');
+ document.getElementById('status').innerHTML=c.length+' total &nbsp;|&nbsp; '+c.filter(x=>x.hwid).length+' activated &nbsp;|&nbsp; <span style="color:#2ecc71">? '+onlineCount+' online now</span>';
  document.getElementById('tbody').innerHTML=c.map(x=>{
   let st='UNUSED',cl='unused';
   if(x.disabled){st='DISABLED';cl='disabled';}
@@ -516,7 +648,7 @@ function render(d){
    '<td>'+hrs(x.total_seconds)+'</td><td class="mini" title="'+fmt(x.last_seen)+'">'+timeAgo(x.last_seen)+'</td><td class="mini">'+(x.app_version||'-')+'</td>'+
    '<td>'+(x.disabled?'<button class="ghost" onclick="disable(\\''+x.code+'\\',false)">Enable</button>':'<button class="ghost" onclick="disable(\\''+x.code+'\\',true)">Disable</button>')+' '+
    (x.hwid?'<button class="ghost" onclick="reset(\\''+x.code+'\\')">Reset</button> ':'')+
-   (x.hwid?'<button class="ghost" onclick="sendDM(\\''+x.hwid+'\\',\\''+( x.note||'')+'\\')" style="background:#1a3a5c">📩 DM</button> ':'')+
+   (x.hwid?'<button class="ghost" onclick="sendDM(\\''+x.hwid+'\\',\\''+( x.note||'')+'\\')" style="background:#1a3a5c">?? DM</button> ':'')+
    '<button class="ghost" onclick="revoke(\\''+x.code+'\\')">Delete</button></td></tr>';
  }).join('');
 }
