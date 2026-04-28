@@ -459,7 +459,7 @@ td.code{font-family:Consolas,monospace}
 .copy{cursor:pointer;color:#4fc3f7;font-size:11px;margin-left:6px}
 .mini{font-size:11px;color:#8b92b3}
 </style></head><body>
-<div id='login' class='login'>
+<div id='login-box' class='login'>
  <h1>AntiAFK Admin</h1>
  <input id='key' type='password' placeholder='Admin Key' autofocus>
  <button onclick='login()'>Login</button>
@@ -497,10 +497,10 @@ td.code{font-family:Consolas,monospace}
 <div id='toast' class='toast'></div>
 <script>
 let KEY=sessionStorage.getItem('akey')||'';
-if(KEY){document.getElementById('login').classList.add('hide');document.getElementById('panel').classList.remove('hide');load();}
+if(KEY){document.getElementById('login-box').classList.add('hide');document.getElementById('panel').classList.remove('hide');load();}
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1800);}
 async function api(p,b){const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});return r.json();}
-async function login(){KEY=document.getElementById('key').value;const r=await api('/list',{admin_key:KEY});if(!r.ok){alert('Wrong key');return;}sessionStorage.setItem('akey',KEY);document.getElementById('login').classList.add('hide');document.getElementById('panel').classList.remove('hide');render(r);}
+async function login(){KEY=document.getElementById('key').value;const r=await api('/list',{admin_key:KEY});if(!r.ok){alert('Wrong key');return;}sessionStorage.setItem('akey',KEY);document.getElementById('login-box').classList.add('hide');document.getElementById('panel').classList.remove('hide');render(r);}
 async function load(){const r=await api('/list',{admin_key:KEY});if(!r.ok){sessionStorage.removeItem('akey');location.reload();return;}render(r);}
 async function gen(){const q=parseInt(document.getElementById('qty').value)||1;const n=document.getElementById('note').value;const e=document.getElementById('expires').value;const r=await api('/generate',{admin_key:KEY,count:q,note:n,expires_days:e||null});if(r.ok){document.getElementById('note').value='';toast('Generated '+r.codes.length);if(r.codes.length===1)copy(r.codes[0]);load();}}
 async function disable(c,on){await api('/disable',{admin_key:KEY,code:c,disabled:on?1:0});toast(on?'Disabled':'Enabled');load();}
@@ -558,17 +558,17 @@ function render(d){
   const online=isOnline(x.last_seen);
   return'<tr style="'+(online?'background:rgba(46,204,113,0.04)':'')+'">'
    +'<td><span class="badge '+cl+'">'+st+'</span>'+(online?' <span class="dot"></span>':'')+' </td>'
-   +'<td class="code">'+x.code+' <span class="copy" onclick="copy(\''+x.code+'\')">copy</span>'+(x.note?'<br><span class="mini">'+x.note+'</span>':'')+'</td>'
+   +'<td class="code">'+x.code+' <span class="copy" onclick="copy(\\''+x.code+'\\')">copy</span>'+(x.note?'<br><span class="mini">'+x.note+'</span>':'')+'</td>'
    +'<td class="mini">'+(x.hwid?trunc(x.hwid):'-')+'</td>'
-   +'<td class="mini"><a href="#" onclick="setExpiry(\''+x.code+'\');return false">'+fmtD(x.expires_at)+'</a></td>'
+   +'<td class="mini"><a href="#" onclick="setExpiry(\\''+x.code+'\\');return false">'+fmtD(x.expires_at)+'</a></td>'
    +'<td>'+hrs(x.total_seconds)+'</td>'
    +'<td class="mini" title="'+fmt(x.last_seen)+'">'+timeAgo(x.last_seen)+'</td>'
    +'<td class="mini">'+(x.app_version||'-')+'</td>'
    +'<td>'
-    +(x.disabled?'<button class="ghost" onclick="disable(\''+x.code+'\',false)">Enable</button>':'<button class="ghost" onclick="disable(\''+x.code+'\',true)">Disable</button>')+' '
-    +(x.hwid?'<button class="ghost" onclick="reset(\''+x.code+'\')">Reset</button> ':'')
-    +(x.hwid?'<button class="ghost" onclick="sendDM(\''+x.hwid+'\',\''+( x.note||'')+'\')" style="background:#1a3a5c">📩 DM</button> ':'')
-    +'<button class="ghost" onclick="revoke(\''+x.code+'\')">Delete</button>'
+    +(x.disabled?'<button class="ghost" onclick="disable(\\''+x.code+'\\',false)">Enable</button>':'<button class="ghost" onclick="disable(\\''+x.code+'\\',true)">Disable</button>')+' '
+    +(x.hwid?'<button class="ghost" onclick="reset(\\''+x.code+'\\')">Reset</button> ':'')
+    +(x.hwid?'<button class="ghost" onclick="sendDM(\\''+x.hwid+'\\',\\''+( x.note||'')+'\\')">📩 DM</button> ':'')
+    +'<button class="ghost" onclick="revoke(\\''+x.code+'\\')">Delete</button>'
    +'</td></tr>';
  }).join('');
 }
