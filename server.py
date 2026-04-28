@@ -230,9 +230,148 @@ def set_version():
     CURRENT_VERSION = (data.get("version") or "").strip() or CURRENT_VERSION
     return jsonify(ok=True, current_version=CURRENT_VERSION)
 
+@app.post("/admin-stats")
+def admin_stats():
+    """Get overall admin statistics"""
+    data = request.json or {}
+    if not _auth(data): return jsonify(ok=False), 401
+    conn, cur = db()
+    cur.execute("SELECT COUNT(*) as total FROM licenses WHERE hwid IS NOT NULL")
+    total_users = cur.fetchone()["total"]
+    cur.execute("SELECT COUNT(*) as active FROM licenses WHERE hwid IS NOT NULL AND disabled=0")
+    active_users = cur.fetchone()["active"]
+    # Online = seen in last 5 minutes
+    from datetime import timezone
+    cutoff = (datetime.utcnow().replace(tzinfo=timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)).isoformat()
+    cur.execute("SELECT COUNT(*) as online FROM licenses WHERE hwid IS NOT NULL AND last_seen > %s", (cutoff,))
+    online = cur.fetchone()["online"]
+    # Total playtime
+    cur.execute("SELECT COALESCE(SUM(total_seconds), 0) as total FROM licenses WHERE hwid IS NOT NULL")
+    total_seconds = cur.fetchone()["total"] or 0
+    # Top 5 users by playtime
+    cur.execute("SELECT hwid, note, total_seconds, last_seen FROM licenses WHERE hwid IS NOT NULL ORDER BY total_seconds DESC LIMIT 5")
+    top_users = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return jsonify(ok=True, total_users=total_users, active_users=active_users, online=online, 
+                   total_seconds=total_seconds, top_users=top_users)
+
+@app.post("/admin-user-stats/<hwid>")
+def admin_user_stats(hwid):
+    """Get detailed stats for a specific user"""
+    data = request.json or {}
+    if not _auth(data): return jsonify(ok=False), 401
+    hwid = hwid.upper()
+    conn, cur = db()
+    cur.execute("SELECT * FROM licenses WHERE hwid=%s", (hwid,))
+    user = cur.fetchone()
+    conn.close()
+    if not user: return jsonify(ok=False, error="User not found"), 404
+    return jsonify(ok=True, user=dict(user))
+
 @app.get("/")
 def health():
     return "AntiAFK License Server OK"
+
+ADMIN_STATS_HTML = """<!doctype html><html><head><meta charset='utf-8'>
+<title>AntiAFK Admin — Stats</title><style>
+*{box-sizing:border-box;font-family:-apple-system,Segoe UI,sans-serif}
+body{background:#1a1a2e;color:#fff;margin:0;padding:20px}
+h1{color:#e94560;margin:0 0 16px}
+h2{color:#a0a0c0;margin:20px 0 10px;font-size:13px;text-transform:uppercase}
+.card{background:#16213e;padding:14px;border-radius:6px;margin-bottom:14px}
+.metric{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.stat{background:#0f3460;padding:12px;border-radius:4px;border-left:3px solid #e94560}
+.stat-label{color:#a0a0c0;font-size:11px;text-transform:uppercase}
+.stat-value{color:#fff;font-size:24px;font-weight:bold}
+table{width:100%;border-collapse:collapse;background:#16213e;border-radius:6px;overflow:hidden}
+th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #0f3460;font-size:12px}
+th{background:#0f3460;color:#a0a0c0;font-weight:500;text-transform:uppercase;font-size:10px}
+.badge{padding:2px 7px;border-radius:10px;font-size:10px;font-weight:bold;background:#0f3460;color:#4fc3f7}
+.back{color:#4fc3f7;cursor:pointer;text-decoration:underline}
+.hide{display:none}
+.toast{position:fixed;bottom:20px;right:20px;background:#0f3460;color:#fff;padding:12px 18px;border-radius:6px;opacity:0;transition:opacity .3s}
+.toast.show{opacity:1}
+</style></head><body>
+<div id='stats' class='hide'>
+  <h1>AntiAFK Admin — Statistics</h1>
+  <div class='card'>
+    <h2>Overview</h2>
+    <div class='metric'>
+      <div class='stat'>
+        <div class='stat-label'>Total Users</div>
+        <div class='stat-value' id='totalUsers'>-</div>
+      </div>
+      <div class='stat'>
+        <div class='stat-label'>Active Users</div>
+        <div class='stat-value' id='activeUsers'>-</div>
+      </div>
+      <div class='stat'>
+        <div class='stat-label'>Online Now</div>
+        <div class='stat-value' id='onlineUsers'>● -</div>
+      </div>
+      <div class='stat'>
+        <div class='stat-label'>Total Playtime</div>
+        <div class='stat-value' id='totalPlaytime'>-</div>
+      </div>
+    </div>
+  </div>
+  <div class='card'>
+    <h2>Top 5 Users by Playtime</h2>
+    <table>
+      <thead><tr><th>HWID</th><th>Note</th><th>Playtime</th><th>Last Seen</th></tr></thead>
+      <tbody id='topUsers'></tbody>
+    </table>
+  </div>
+  <p style='text-align:center;color:#a0a0c0;font-size:12px'><span class='back' onclick='location.href="/admin"'>← Back to Admin Panel</span></p>
+</div>
+<div id='login'>
+  <div style='max-width:400px;margin:100px auto;background:#16213e;padding:30px;border-radius:8px'>
+    <h1>AntiAFK Admin Stats</h1>
+    <input id='key' type='password' placeholder='Admin Key' autofocus style='width:100%;padding:8px;background:#0f3460;border:none;color:#fff;border-radius:4px;margin-bottom:10px'>
+    <button onclick='login()' style='width:100%;padding:8px;background:#e94560;color:#fff;border:none;border-radius:4px;font-weight:bold;cursor:pointer'>Login</button>
+  </div>
+</div>
+<div id='toast' class='toast'></div>
+<script>
+let KEY = sessionStorage.getItem('stats_key') || '';
+if(KEY) { document.getElementById('login').style.display='none'; document.getElementById('stats').classList.remove('hide'); load(); }
+async function api(p, b){ const r = await fetch(p, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(b)}); return r.json(); }
+function toast(m){ const t = document.getElementById('toast'); t.textContent = m; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 1800); }
+async function login(){
+  KEY = document.getElementById('key').value;
+  const r = await api('/admin-stats', {admin_key: KEY});
+  if(!r.ok) { alert('Wrong key'); return; }
+  sessionStorage.setItem('stats_key', KEY);
+  document.getElementById('login').style.display = 'none';
+  document.getElementById('stats').classList.remove('hide');
+  render(r);
+}
+async function load(){
+  const r = await api('/admin-stats', {admin_key: KEY});
+  if(!r.ok) { sessionStorage.removeItem('stats_key'); location.reload(); return; }
+  render(r);
+}
+function render(d){
+  document.getElementById('totalUsers').textContent = d.total_users;
+  document.getElementById('activeUsers').textContent = d.active_users;
+  document.getElementById('onlineUsers').textContent = '● ' + d.online;
+  const hrs = (d.total_seconds / 3600).toFixed(1);
+  document.getElementById('totalPlaytime').textContent = hrs + 'h';
+  document.getElementById('topUsers').innerHTML = d.top_users.map(u => 
+    '<tr><td style="font-family:monospace;font-size:11px">' + (u.hwid || '-').substring(0,16) + '...</td>' +
+    '<td>' + (u.note || '-') + '</td>' +
+    '<td>' + (u.total_seconds ? (u.total_seconds / 3600).toFixed(1) + 'h' : '0h') + '</td>' +
+    '<td style="font-size:11px">' + (u.last_seen ? new Date(u.last_seen).toLocaleString() : 'Never') + '</td></tr>'
+  ).join('');
+}
+document.getElementById('key').addEventListener('keypress', e => { if(e.key === 'Enter') login(); });
+setInterval(() => { if(document.getElementById('stats').style.display !== 'none') load(); }, 30000);
+</script></body></html>"""
+
+@app.get("/admin-stats-page")
+def admin_stats_page():
+    """Admin statistics dashboard (requires auth in JS)"""
+    return Response(ADMIN_STATS_HTML, mimetype="text/html")
 
 ADMIN_HTML = """<!doctype html><html><head><meta charset='utf-8'>
 <title>AntiAFK Admin</title><style>
@@ -276,6 +415,10 @@ td.code{font-family:Consolas,monospace}
 </div>
 <div id='panel' class='hide'>
  <h1>AntiAFK License Admin <span class='mini' id='version'></span></h1>
+ <div style='display:flex;align-items:center;margin-bottom:16px'>
+  <h1 style='margin:0;flex:1'>AntiAFK License Admin <span class='mini' id='version'></span></h1>
+  <button class='ghost' onclick="window.open('/admin-stats-page','_blank')" style='background:#1a3a5c;padding:6px 12px;font-size:11px;cursor:pointer'>📊 View Stats</button>
+ </div>
  <div class='card'>
   <h3>Generate Codes</h3>
   <div class='bar'>
