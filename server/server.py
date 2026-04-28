@@ -3,7 +3,11 @@ License Server v3 — PostgreSQL (data persists across restarts)
 Built on v2 (known-good) + advanced admin panel endpoints
 """
 import os, secrets, string, psycopg2, psycopg2.extras, threading, urllib.request, json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+def utcnow():
+    """Timezone-aware UTC now, returned as a naive datetime for DB compatibility."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 from flask import Flask, request, jsonify, Response
 
 ADMIN_KEY           = os.environ.get("ADMIN_KEY", "CHANGE_ME")
@@ -50,7 +54,7 @@ def _log(cur, hwid, event_type, details, ip=""):
     try:
         cur.execute(
             "INSERT INTO activity_logs(hwid, event_type, details, created_at, ip_address) VALUES(%s,%s,%s,%s,%s)",
-            (hwid, event_type, details, datetime.utcnow().isoformat(), ip)
+            (hwid, event_type, details, utcnow().isoformat(), ip)
         )
     except Exception:
         pass
@@ -62,7 +66,7 @@ def fire_webhook(title, description, color=0x5865F2, fields=None):
     def _send():
         try:
             embed = {"title": title, "description": description, "color": color,
-                     "timestamp": datetime.utcnow().isoformat() + "Z",
+                     "timestamp": utcnow().isoformat() + "Z",
                      "fields": fields or []}
             payload = json.dumps({"embeds": [embed]}).encode()
             req = urllib.request.Request(
@@ -90,7 +94,7 @@ def _valid_license(hwid):
     if row["disabled"]: return row, "disabled"
     if row["expires_at"]:
         try:
-            if datetime.utcnow() > datetime.fromisoformat(row["expires_at"]): return row, "expired"
+            if utcnow() > datetime.fromisoformat(row["expires_at"]): return row, "expired"
         except: pass
     return row, None
 
@@ -112,13 +116,13 @@ def activate():
         if row["disabled"]: return jsonify(ok=False, error="code has been disabled"), 403
         if row["expires_at"]:
             try:
-                if datetime.utcnow() > datetime.fromisoformat(row["expires_at"]):
+                if utcnow() > datetime.fromisoformat(row["expires_at"]):
                     return jsonify(ok=False, error="code has expired"), 403
             except: pass
         if row["hwid"] and row["hwid"] != hwid:
             return jsonify(ok=False, error="code already used on another device"), 403
         if not row["hwid"]:
-            now = datetime.utcnow()
+            now = utcnow()
             # Trial code: set expiry from activation time if not already set
             new_expires = row.get("expires_at")
             if row.get("trial_hours") and not new_expires:
@@ -158,7 +162,7 @@ def verify():
         return jsonify(valid=False, error=err or "no license")
     conn, cur = db()
     try:
-        now_iso = datetime.utcnow().isoformat()
+        now_iso = utcnow().isoformat()
         cur.execute("UPDATE licenses SET last_seen=%s, total_seconds=COALESCE(total_seconds,0)+%s, app_version=%s WHERE hwid=%s",
                     (now_iso, secs, ver or row.get("app_version"), hwid))
         cur.execute("UPDATE active_sessions SET last_seen=%s WHERE hwid=%s", (now_iso, hwid))
@@ -188,7 +192,7 @@ def generate():
     max_sess    = int(data.get("max_sessions", 1) or 1)
     expires = None
     if days:
-        try: expires = (datetime.utcnow() + timedelta(days=float(days))).isoformat()
+        try: expires = (utcnow() + timedelta(days=float(days))).isoformat()
         except: pass
     if trial_hours:
         try: trial_hours = float(trial_hours)
@@ -200,7 +204,7 @@ def generate():
             c = gen_code()
             cur.execute(
                 "INSERT INTO licenses(code, created_at, note, expires_at, trial_hours, max_sessions) VALUES(%s,%s,%s,%s,%s,%s)",
-                (c, datetime.utcnow().isoformat(), note, expires, trial_hours, max_sess))
+                (c, utcnow().isoformat(), note, expires, trial_hours, max_sess))
             new.append(c)
     finally:
         conn.close()
@@ -265,7 +269,7 @@ def set_expiry():
     days = data.get("days")
     expires = None
     if days not in (None, "", 0, "0"):
-        try: expires = (datetime.utcnow() + timedelta(days=float(days))).isoformat()
+        try: expires = (utcnow() + timedelta(days=float(days))).isoformat()
         except: pass
     conn, cur = db()
     try:
@@ -304,12 +308,12 @@ def send_to_all():
     conn, cur = db()
     count = 0
     try:
-        cutoff = (datetime.utcnow() - timedelta(minutes=10)).isoformat()
+        cutoff = (utcnow() - timedelta(minutes=10)).isoformat()
         cur.execute("SELECT hwid FROM licenses WHERE hwid IS NOT NULL AND last_seen > %s", (cutoff,))
         rows = cur.fetchall()
         for row in rows:
             cur.execute("INSERT INTO user_messages(hwid, message, created_at) VALUES(%s,%s,%s)",
-                        (row["hwid"], message, datetime.utcnow().isoformat()))
+                        (row["hwid"], message, utcnow().isoformat()))
             count += 1
     finally:
         conn.close()
@@ -325,7 +329,7 @@ def send_to_user():
     conn, cur = db()
     try:
         cur.execute("INSERT INTO user_messages(hwid, message, created_at) VALUES(%s,%s,%s)",
-                    (hwid, message, datetime.utcnow().isoformat()))
+                    (hwid, message, utcnow().isoformat()))
         _log(cur, hwid, "MESSAGE", message[:80], request.remote_addr)
     finally:
         conn.close()
@@ -341,7 +345,7 @@ def set_broadcast():
         if msg:
             cur.execute("DELETE FROM broadcast WHERE id=1")
             cur.execute("INSERT INTO broadcast(id, message, updated_at) VALUES(1, %s, %s)",
-                        (msg, datetime.utcnow().isoformat()))
+                        (msg, utcnow().isoformat()))
         else:
             cur.execute("DELETE FROM broadcast WHERE id=1")
     finally:
@@ -360,13 +364,13 @@ def session_start():
     conn, cur = db()
     try:
         # Check if there's already an active session (heartbeat seen < 2 min ago)
-        cutoff = (datetime.utcnow() - timedelta(minutes=2)).isoformat()
+        cutoff = (utcnow() - timedelta(minutes=2)).isoformat()
         cur.execute("SELECT last_seen FROM active_sessions WHERE hwid=%s", (hwid,))
         existing = cur.fetchone()
         if existing and (existing["last_seen"] or "") > cutoff:
             _log(cur, hwid, "SESSION_BLOCKED", "duplicate session attempt", request.remote_addr)
             return jsonify(ok=False, error="session already active on another instance"), 409
-        now = datetime.utcnow().isoformat()
+        now = utcnow().isoformat()
         cur.execute("""
             INSERT INTO active_sessions(hwid, started_at, last_seen) VALUES(%s,%s,%s)
             ON CONFLICT(hwid) DO UPDATE SET started_at=EXCLUDED.started_at, last_seen=EXCLUDED.last_seen
@@ -426,7 +430,7 @@ def set_version():
 def admin_system_stats():
     data = request.json or {}
     if not _auth(data): return jsonify(ok=False), 401
-    now = datetime.utcnow()
+    now = utcnow()
     conn, cur = db()
     try:
         cur.execute("SELECT COUNT(*) as v FROM licenses WHERE hwid IS NOT NULL")
@@ -466,7 +470,7 @@ def admin_system_stats():
 def admin_all_users():
     data = request.json or {}
     if not _auth(data): return jsonify(ok=False), 401
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = utcnow().isoformat()
     status = data.get("status")
     search = (data.get("search") or "").strip()
     conn, cur = db()
@@ -483,7 +487,7 @@ def admin_all_users():
             query += " AND disabled=1"
         elif status == "inactive":
             query += " AND last_seen < %s"
-            params.append((datetime.utcnow() - timedelta(hours=24)).isoformat())
+            params.append((utcnow() - timedelta(hours=24)).isoformat())
         if search:
             query += " AND (hwid ILIKE %s OR note ILIKE %s)"
             params += [f"%{search}%", f"%{search}%"]
@@ -1459,10 +1463,10 @@ def _start_discord_bot():
             c = gen_code()
             expires = None
             if days:
-                try: expires = (datetime.utcnow() + timedelta(days=float(days))).isoformat()
+                try: expires = (utcnow() + timedelta(days=float(days))).isoformat()
                 except: pass
             cur.execute("INSERT INTO licenses(code, created_at, note, expires_at) VALUES(%s,%s,%s,%s)",
-                        (c, datetime.utcnow().isoformat(), note, expires))
+                        (c, utcnow().isoformat(), note, expires))
         finally:
             conn.close()
 
@@ -1492,7 +1496,7 @@ def _start_discord_bot():
         try:
             c = gen_code()
             cur.execute("INSERT INTO licenses(code, created_at, note, trial_hours) VALUES(%s,%s,%s,%s)",
-                        (c, datetime.utcnow().isoformat(), note, h))
+                        (c, utcnow().isoformat(), note, h))
         finally:
             conn.close()
 
@@ -1561,7 +1565,7 @@ def _start_discord_bot():
             await ctx.send(f"❌ No license found for `{target}`"); return
         exp = row.get("expires_at")
         if row["disabled"]:          status = "🚫 DISABLED"
-        elif exp and datetime.utcnow() > datetime.fromisoformat(exp): status = "⌛ EXPIRED"
+        elif exp and utcnow() > datetime.fromisoformat(exp): status = "⌛ EXPIRED"
         elif row["hwid"]:            status = "✅ ACTIVE"
         else:                        status = "⬜ UNUSED"
         trial_line = f"\n**Trial:** {row['trial_hours']}h from activation" if row.get("trial_hours") else ""
@@ -1580,7 +1584,7 @@ def _start_discord_bot():
         if not await _guard(ctx): return
         conn, cur = db()
         try:
-            cutoff = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+            cutoff = (utcnow() - timedelta(minutes=5)).isoformat()
             cur.execute("SELECT note, hwid, last_seen FROM licenses WHERE last_seen > %s AND hwid IS NOT NULL", (cutoff,))
             rows = cur.fetchall()
         finally:
@@ -1602,7 +1606,7 @@ def _start_discord_bot():
             if not row or not row["hwid"]:
                 await ctx.send(f"❌ User `{target}` not found in the license database"); return
             cur.execute("INSERT INTO user_messages(hwid, message, created_at) VALUES(%s,%s,%s)",
-                        (row["hwid"], message, datetime.utcnow().isoformat()))
+                        (row["hwid"], message, utcnow().isoformat()))
         finally:
             conn.close()
         await ctx.send(f"📩 In-app message queued for **{target}** — delivers within 5s")
@@ -1613,8 +1617,8 @@ def _start_discord_bot():
         if not await _guard(ctx): return
         conn, cur = db()
         try:
-            cutoff5  = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
-            cutoff24 = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+            cutoff5  = (utcnow() - timedelta(minutes=5)).isoformat()
+            cutoff24 = (utcnow() - timedelta(hours=24)).isoformat()
             cur.execute("SELECT COUNT(*) as v FROM licenses WHERE hwid IS NOT NULL")
             total = cur.fetchone()["v"]
             cur.execute("SELECT COUNT(*) as v FROM licenses WHERE last_seen > %s AND hwid IS NOT NULL", (cutoff5,))
@@ -1631,7 +1635,7 @@ def _start_discord_bot():
             conn.close()
         ver_lines = "\n".join(f"  v{r['app_version']}: {r['c']} users" for r in versions) or "  —"
         embed = discord.Embed(title="📊 Server Status", color=0x5865F2,
-            timestamp=datetime.utcnow())
+            timestamp=utcnow())
         embed.add_field(name="Users", value=f"🟢 **{online}** online\n👥 {total} activated\n⬜ {unused} unused\n🚫 {banned} banned", inline=True)
         embed.add_field(name="Activity", value=f"📅 {active24} active (24h)\n🕐 {online} active (5m)", inline=True)
         embed.add_field(name="Versions", value=ver_lines, inline=False)
@@ -1649,7 +1653,7 @@ def _start_discord_bot():
             code, row = _resolve_license(cur, target, ctx.message.mentions)
             if not row: await ctx.send(f"❌ No license found for `{target}`"); return
             current = row.get("expires_at")
-            base = max(datetime.fromisoformat(current), datetime.utcnow()) if current else datetime.utcnow()
+            base = max(datetime.fromisoformat(current), utcnow()) if current else utcnow()
             new_exp = (base + timedelta(days=d)).isoformat()
             cur.execute("UPDATE licenses SET expires_at=%s WHERE code=%s", (new_exp, code))
         finally:
@@ -1682,7 +1686,7 @@ def _start_discord_bot():
             code, row = _resolve_license(cur, target, ctx.message.mentions)
             if not row: await ctx.send(f"❌ No license found for `{target}`"); return
             cur.execute("UPDATE licenses SET expires_at=%s WHERE code=%s",
-                        (datetime.utcnow().isoformat(), code))
+                        (utcnow().isoformat(), code))
         finally:
             conn.close()
         name = row.get("note") or code
@@ -1714,7 +1718,7 @@ def _start_discord_bot():
         except: d = 7
         conn, cur = db()
         try:
-            cutoff = (datetime.utcnow() - timedelta(days=d)).isoformat()
+            cutoff = (utcnow() - timedelta(days=d)).isoformat()
             cur.execute("""SELECT note, hwid, last_seen FROM licenses
                            WHERE hwid IS NOT NULL AND disabled=0
                            AND (last_seen IS NULL OR last_seen < %s)
@@ -1753,13 +1757,13 @@ def _start_discord_bot():
             rows = cur.fetchall()
         finally:
             conn.close()
-        cutoff = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+        cutoff = (utcnow() - timedelta(minutes=5)).isoformat()
         lines = []
         for r in rows:
             name = r.get("note") or "—"
             exp = r.get("expires_at")
             if r["disabled"]:                        tag = "🚫"
-            elif exp and exp < datetime.utcnow().isoformat(): tag = "⌛"
+            elif exp and exp < utcnow().isoformat(): tag = "⌛"
             elif r.get("last_seen", "") > cutoff:   tag = "🟢"
             else:                                    tag = "⚫"
             lines.append(f"{tag} **{name}**")
@@ -1808,13 +1812,13 @@ def _start_discord_bot():
         conn, cur = db()
         try:
             if target.lower() == "all":
-                cutoff = (datetime.utcnow() - timedelta(minutes=10)).isoformat()
+                cutoff = (utcnow() - timedelta(minutes=10)).isoformat()
                 cur.execute("SELECT hwid FROM licenses WHERE hwid IS NOT NULL AND last_seen > %s", (cutoff,))
                 rows = cur.fetchall()
                 count = 0
                 for r in rows:
                     cur.execute("INSERT INTO user_messages(hwid, message, created_at) VALUES(%s,%s,%s)",
-                                (r["hwid"], message, datetime.utcnow().isoformat()))
+                                (r["hwid"], message, utcnow().isoformat()))
                     count += 1
                 await ctx.send(f"📢 Broadcast queued for **{count}** online user(s)")
             else:
@@ -1823,7 +1827,7 @@ def _start_discord_bot():
                 if not row or not row["hwid"]:
                     await ctx.send(f"❌ User `{target}` not found"); return
                 cur.execute("INSERT INTO user_messages(hwid, message, created_at) VALUES(%s,%s,%s)",
-                            (row["hwid"], message, datetime.utcnow().isoformat()))
+                            (row["hwid"], message, utcnow().isoformat()))
                 await ctx.send(f"📩 Message queued for **{target}**")
         finally:
             conn.close()
@@ -1847,8 +1851,8 @@ def _start_discord_bot():
         if not ch: return
         conn, cur = db()
         try:
-            soon  = (datetime.utcnow() + timedelta(days=3)).isoformat()
-            now   = datetime.utcnow().isoformat()
+            soon  = (utcnow() + timedelta(days=3)).isoformat()
+            now   = utcnow().isoformat()
             cur.execute("""SELECT note, code, expires_at FROM licenses
                            WHERE expires_at IS NOT NULL AND expires_at > %s AND expires_at < %s
                            AND disabled=0 AND hwid IS NOT NULL""", (now, soon))
@@ -1865,7 +1869,7 @@ def _start_discord_bot():
             description="\n".join(lines))
         await ch.send(embed=embed)
 
-    _last_activation_check = {"ts": datetime.utcnow().isoformat()}
+    _last_activation_check = {"ts": utcnow().isoformat()}
 
     @tasks.loop(seconds=30)
     async def activation_watch():
