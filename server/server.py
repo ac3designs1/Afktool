@@ -1838,8 +1838,10 @@ def _start_discord_bot():
         print(f"[Discord] Logged in as {bot.user}")
         if _allowed_roles:
             print(f"[Discord] Restricted to roles: {', '.join(_allowed_roles)}")
-        expiry_check.start()
-        activation_watch.start()
+        if not expiry_check.is_running():
+            expiry_check.start()
+        if not activation_watch.is_running():
+            activation_watch.start()
 
     import discord.ext.tasks as tasks
 
