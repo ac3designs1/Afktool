@@ -2,14 +2,17 @@
 License Server v3 — PostgreSQL (data persists across restarts)
 Built on v2 (known-good) + advanced admin panel endpoints
 """
-import os, secrets, string, psycopg2, psycopg2.extras
+import os, secrets, string, psycopg2, psycopg2.extras, threading, urllib.request, json
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, Response
 
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "CHANGE_ME")
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-CURRENT_VERSION = os.environ.get("APP_VERSION", "1.0.0")
-DOWNLOAD_URL = os.environ.get("DOWNLOAD_URL", "")
+ADMIN_KEY           = os.environ.get("ADMIN_KEY", "CHANGE_ME")
+DATABASE_URL        = os.environ.get("DATABASE_URL", "")
+CURRENT_VERSION     = os.environ.get("APP_VERSION", "1.0.0")
+DOWNLOAD_URL        = os.environ.get("DOWNLOAD_URL", "")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+DISCORD_BOT_TOKEN   = os.environ.get("DISCORD_BOT_TOKEN", "")
+DISCORD_CHANNEL_ID  = int(os.environ.get("DISCORD_CHANNEL_ID", "0") or 0)
 
 app = Flask(__name__)
 
@@ -24,8 +27,11 @@ def db():
     cur.execute("""CREATE TABLE IF NOT EXISTS licenses (
         code TEXT PRIMARY KEY, hwid TEXT, activated_at TEXT, created_at TEXT,
         note TEXT, disabled INTEGER DEFAULT 0, expires_at TEXT,
-        last_seen TEXT, total_seconds INTEGER DEFAULT 0, app_version TEXT
+        last_seen TEXT, total_seconds INTEGER DEFAULT 0, app_version TEXT,
+        trial_hours REAL, max_sessions INTEGER DEFAULT 1
     )""")
+    cur.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS trial_hours REAL")
+    cur.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS max_sessions INTEGER DEFAULT 1")
     cur.execute("""CREATE TABLE IF NOT EXISTS broadcast (
         id INTEGER PRIMARY KEY CHECK (id=1), message TEXT, updated_at TEXT
     )""")
@@ -34,6 +40,9 @@ def db():
     )""")
     cur.execute("""CREATE TABLE IF NOT EXISTS activity_logs (
         id SERIAL PRIMARY KEY, hwid TEXT, event_type TEXT, details TEXT, created_at TEXT, ip_address TEXT
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS active_sessions (
+        hwid TEXT PRIMARY KEY, started_at TEXT, last_seen TEXT
     )""")
     return conn, cur
 
@@ -45,6 +54,24 @@ def _log(cur, hwid, event_type, details, ip=""):
         )
     except Exception:
         pass
+
+def fire_webhook(title, description, color=0x5865F2, fields=None):
+    """Non-blocking Discord webhook embed. Silently ignores failures."""
+    if not DISCORD_WEBHOOK_URL:
+        return
+    def _send():
+        try:
+            embed = {"title": title, "description": description, "color": color,
+                     "timestamp": datetime.utcnow().isoformat() + "Z",
+                     "fields": fields or []}
+            payload = json.dumps({"embeds": [embed]}).encode()
+            req = urllib.request.Request(
+                DISCORD_WEBHOOK_URL, data=payload,
+                headers={"Content-Type": "application/json"}, method="POST")
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass
+    threading.Thread(target=_send, daemon=True).start()
 
 def gen_code():
     alpha = string.ascii_uppercase + string.digits
@@ -91,8 +118,18 @@ def activate():
         if row["hwid"] and row["hwid"] != hwid:
             return jsonify(ok=False, error="code already used on another device"), 403
         if not row["hwid"]:
-            cur.execute("UPDATE licenses SET hwid=%s, activated_at=%s WHERE code=%s",
-                        (hwid, datetime.utcnow().isoformat(), code))
+            now = datetime.utcnow()
+            # Trial code: set expiry from activation time if not already set
+            new_expires = row.get("expires_at")
+            if row.get("trial_hours") and not new_expires:
+                new_expires = (now + timedelta(hours=float(row["trial_hours"]))).isoformat()
+            cur.execute("UPDATE licenses SET hwid=%s, activated_at=%s, expires_at=%s WHERE code=%s",
+                        (hwid, now.isoformat(), new_expires, code))
+            note = row.get("note") or "—"
+            trial_tag = f" · Trial {row['trial_hours']}h" if row.get("trial_hours") else ""
+            fire_webhook("🔑 License Activated",
+                         f"**User:** {note}{trial_tag}\n**Code:** `{code}`\n**HWID:** `{hwid[:20]}...`",
+                         color=0x2ecc71)
         _log(cur, hwid, "ACTIVATE", f"code={code}", request.remote_addr)
     finally:
         conn.close()
@@ -121,8 +158,10 @@ def verify():
         return jsonify(valid=False, error=err or "no license")
     conn, cur = db()
     try:
+        now_iso = datetime.utcnow().isoformat()
         cur.execute("UPDATE licenses SET last_seen=%s, total_seconds=COALESCE(total_seconds,0)+%s, app_version=%s WHERE hwid=%s",
-                    (datetime.utcnow().isoformat(), secs, ver or row.get("app_version"), hwid))
+                    (now_iso, secs, ver or row.get("app_version"), hwid))
+        cur.execute("UPDATE active_sessions SET last_seen=%s WHERE hwid=%s", (now_iso, hwid))
         if ver and ver != CURRENT_VERSION:
             _log(cur, hwid, "VERSION_OLD", f"client={ver} server={CURRENT_VERSION}", ip)
         cur.execute("SELECT message, updated_at FROM broadcast WHERE id=1")
@@ -142,20 +181,26 @@ def verify():
 def generate():
     data = request.json or {}
     if not _auth(data): return jsonify(ok=False), 401
-    count = int(data.get("count", 1))
-    note  = (data.get("note") or "").strip()
-    days  = data.get("expires_days")
+    count       = int(data.get("count", 1))
+    note        = (data.get("note") or "").strip()
+    days        = data.get("expires_days")
+    trial_hours = data.get("trial_hours")
+    max_sess    = int(data.get("max_sessions", 1) or 1)
     expires = None
     if days:
         try: expires = (datetime.utcnow() + timedelta(days=float(days))).isoformat()
         except: pass
+    if trial_hours:
+        try: trial_hours = float(trial_hours)
+        except: trial_hours = None
     conn, cur = db()
     new = []
     try:
         for _ in range(count):
             c = gen_code()
-            cur.execute("INSERT INTO licenses(code, created_at, note, expires_at) VALUES(%s,%s,%s,%s)",
-                        (c, datetime.utcnow().isoformat(), note, expires))
+            cur.execute(
+                "INSERT INTO licenses(code, created_at, note, expires_at, trial_hours, max_sessions) VALUES(%s,%s,%s,%s,%s,%s)",
+                (c, datetime.utcnow().isoformat(), note, expires, trial_hours, max_sess))
             new.append(c)
     finally:
         conn.close()
@@ -198,10 +243,16 @@ def toggle_disable():
     conn, cur = db()
     try:
         cur.execute("UPDATE licenses SET disabled=%s WHERE code=%s", (disabled_val, code))
-        cur.execute("SELECT hwid FROM licenses WHERE code=%s", (code,))
+        cur.execute("SELECT hwid, note FROM licenses WHERE code=%s", (code,))
         row = cur.fetchone()
         if row and row["hwid"]:
-            _log(cur, row["hwid"], "BAN" if disabled_val else "UNBAN", f"code={code}", request.remote_addr)
+            event = "BAN" if disabled_val else "UNBAN"
+            _log(cur, row["hwid"], event, f"code={code}", request.remote_addr)
+            note = row.get("note") or "—"
+            if disabled_val:
+                fire_webhook("🚫 User Banned", f"**User:** {note}\n**Code:** `{code}`", color=0xe74c3c)
+            else:
+                fire_webhook("✅ User Unbanned", f"**User:** {note}\n**Code:** `{code}`", color=0x2ecc71)
     finally:
         conn.close()
     return jsonify(ok=True)
@@ -299,7 +350,7 @@ def set_broadcast():
 
 @app.post("/session-start")
 def session_start():
-    """Client calls this on launch, after license is verified."""
+    """Client calls this on launch. Enforces max_sessions limit."""
     data = request.json or {}
     hwid = (data.get("hwid") or "").strip().upper()
     ver  = (data.get("version") or "").strip()
@@ -308,6 +359,18 @@ def session_start():
     if err or not row: return jsonify(ok=False, error=err or "no license")
     conn, cur = db()
     try:
+        # Check if there's already an active session (heartbeat seen < 2 min ago)
+        cutoff = (datetime.utcnow() - timedelta(minutes=2)).isoformat()
+        cur.execute("SELECT last_seen FROM active_sessions WHERE hwid=%s", (hwid,))
+        existing = cur.fetchone()
+        if existing and (existing["last_seen"] or "") > cutoff:
+            _log(cur, hwid, "SESSION_BLOCKED", "duplicate session attempt", request.remote_addr)
+            return jsonify(ok=False, error="session already active on another instance"), 409
+        now = datetime.utcnow().isoformat()
+        cur.execute("""
+            INSERT INTO active_sessions(hwid, started_at, last_seen) VALUES(%s,%s,%s)
+            ON CONFLICT(hwid) DO UPDATE SET started_at=EXCLUDED.started_at, last_seen=EXCLUDED.last_seen
+        """, (hwid, now, now))
         _log(cur, hwid, "SESSION_START", f"version={ver}", request.remote_addr)
     finally:
         conn.close()
@@ -324,6 +387,7 @@ def session_end():
     conn, cur = db()
     try:
         h = round(secs / 3600, 2)
+        cur.execute("DELETE FROM active_sessions WHERE hwid=%s", (hwid,))
         _log(cur, hwid, "SESSION_END", f"duration={h}h version={ver}", request.remote_addr)
     finally:
         conn.close()
@@ -738,15 +802,23 @@ textarea{resize:vertical}
       <div class="card">
         <div class="card-title">Generate New Codes</div>
         <div class="input-row">
-          <input type="number" id="code-qty" value="1" min="1" max="100" style="width:72px" placeholder="Qty">
-          <input type="text" id="code-note" placeholder="Username / note" style="flex:1;min-width:140px">
-          <select id="code-expires">
+          <input type="number" id="code-qty" value="1" min="1" max="100" style="width:60px" placeholder="Qty">
+          <input type="text" id="code-note" placeholder="Username / note" style="flex:1;min-width:120px">
+          <select id="code-expires" title="Expiry from generation date">
             <option value="">Lifetime</option>
             <option value="1">1 Day</option>
             <option value="7">7 Days</option>
             <option value="30">30 Days</option>
             <option value="90">90 Days</option>
             <option value="365">1 Year</option>
+          </select>
+          <select id="code-trial" title="Trial: expiry starts from first activation">
+            <option value="">No Trial</option>
+            <option value="1">Trial 1h</option>
+            <option value="6">Trial 6h</option>
+            <option value="24">Trial 24h</option>
+            <option value="72">Trial 3 days</option>
+            <option value="168">Trial 7 days</option>
           </select>
           <button class="btn btn-primary" id="gen-btn">Generate</button>
         </div>
@@ -1076,8 +1148,10 @@ document.getElementById('gen-btn').addEventListener('click', async()=>{
   const qty=parseInt(document.getElementById('code-qty').value)||1;
   const note=document.getElementById('code-note').value.trim();
   const days=document.getElementById('code-expires').value;
+  const trial=document.getElementById('code-trial').value;
   if(qty<1||qty>100){ toast('Qty must be 1–100'); return; }
-  const r=await api('/generate',{admin_key:KEY,count:qty,note,expires_days:days||null});
+  const r=await api('/generate',{admin_key:KEY,count:qty,note,
+    expires_days:days||null, trial_hours:trial||null});
   if(!r.ok){ toast('Error: '+(r.error||'?')); return; }
   toast('✓ Generated '+r.codes.length+' code(s)');
   if(r.codes.length===1){ navigator.clipboard.writeText(r.codes[0]); toast('✓ Copied: '+r.codes[0]); }
@@ -1263,6 +1337,187 @@ setInterval(()=>{
 @app.get("/admin")
 def admin_page():
     return Response(ADMIN_HTML, mimetype="text/html")
+
+# ---------------------------------------------------------------------------
+# Discord bot (optional — only starts if DISCORD_BOT_TOKEN is set)
+# ---------------------------------------------------------------------------
+
+def _start_discord_bot():
+    try:
+        import asyncio, discord
+        from discord.ext import commands as dc_commands
+    except ImportError:
+        print("[Discord] discord.py not installed — bot disabled")
+        return
+
+    intents = discord.Intents.default()
+    intents.message_content = True
+    bot = dc_commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+    def _check(ctx):
+        """Only respond in the configured channel (or anywhere if not set)."""
+        return DISCORD_CHANNEL_ID == 0 or ctx.channel.id == DISCORD_CHANNEL_ID
+
+    @bot.event
+    async def on_ready():
+        print(f"[Discord] Logged in as {bot.user}")
+
+    @bot.command(name="help")
+    async def cmd_help(ctx):
+        if not _check(ctx): return
+        embed = discord.Embed(title="AFK Tool Bot Commands", color=0x5865F2,
+            description=(
+                "`!gen <note> [days]` — Generate a lifetime (or N-day) code\n"
+                "`!trial <note> <hours>` — Generate a trial code (expires from activation)\n"
+                "`!revoke <code>` — Delete a license code\n"
+                "`!ban <code>` — Disable a license\n"
+                "`!unban <code>` — Re-enable a license\n"
+                "`!lookup <code>` — Look up a code's details\n"
+                "`!online` — Show currently online users\n"
+                "`!dm <note_or_hwid> <message>` — Send a message to a user"
+            ))
+        await ctx.send(embed=embed)
+
+    @bot.command(name="gen")
+    async def cmd_gen(ctx, note: str = "discord", days: str = ""):
+        if not _check(ctx): return
+        payload = {"admin_key": ADMIN_KEY, "count": 1, "note": note,
+                   "expires_days": days or None}
+        conn, cur = db()
+        try:
+            c = gen_code()
+            expires = None
+            if days:
+                try: expires = (datetime.utcnow() + timedelta(days=float(days))).isoformat()
+                except: pass
+            cur.execute("INSERT INTO licenses(code, created_at, note, expires_at) VALUES(%s,%s,%s,%s)",
+                        (c, datetime.utcnow().isoformat(), note, expires))
+        finally:
+            conn.close()
+        exp_str = f"Expires in {days} days" if days else "Lifetime"
+        embed = discord.Embed(title="✅ Code Generated", color=0x2ecc71,
+            description=f"**Code:** `{c}`\n**User:** {note}\n**Expiry:** {exp_str}")
+        await ctx.send(embed=embed)
+
+    @bot.command(name="trial")
+    async def cmd_trial(ctx, note: str = "trial", hours: str = "24"):
+        if not _check(ctx): return
+        conn, cur = db()
+        try:
+            c = gen_code()
+            try: h = float(hours)
+            except: h = 24.0
+            cur.execute("INSERT INTO licenses(code, created_at, note, trial_hours) VALUES(%s,%s,%s,%s)",
+                        (c, datetime.utcnow().isoformat(), note, h))
+        finally:
+            conn.close()
+        embed = discord.Embed(title="⏱ Trial Code Generated", color=0xf39c12,
+            description=f"**Code:** `{c}`\n**User:** {note}\n**Trial:** {h}h from first activation")
+        await ctx.send(embed=embed)
+
+    @bot.command(name="revoke")
+    async def cmd_revoke(ctx, code: str = ""):
+        if not _check(ctx): return
+        if not code: await ctx.send("Usage: `!revoke <CODE>`"); return
+        conn, cur = db()
+        try:
+            cur.execute("SELECT note FROM licenses WHERE code=%s", (code.upper(),))
+            row = cur.fetchone()
+            cur.execute("DELETE FROM licenses WHERE code=%s", (code.upper(),))
+        finally:
+            conn.close()
+        if row:
+            await ctx.send(f"🗑 Revoked `{code.upper()}` ({row.get('note') or '—'})")
+        else:
+            await ctx.send(f"❌ Code `{code.upper()}` not found")
+
+    @bot.command(name="ban")
+    async def cmd_ban(ctx, code: str = ""):
+        if not _check(ctx): return
+        if not code: await ctx.send("Usage: `!ban <CODE>`"); return
+        conn, cur = db()
+        try:
+            cur.execute("UPDATE licenses SET disabled=1 WHERE code=%s", (code.upper(),))
+            cur.execute("SELECT note, hwid FROM licenses WHERE code=%s", (code.upper(),))
+            row = cur.fetchone()
+        finally:
+            conn.close()
+        note = row.get("note") or "—" if row else "—"
+        await ctx.send(f"🚫 Banned `{code.upper()}` ({note})")
+
+    @bot.command(name="unban")
+    async def cmd_unban(ctx, code: str = ""):
+        if not _check(ctx): return
+        if not code: await ctx.send("Usage: `!unban <CODE>`"); return
+        conn, cur = db()
+        try:
+            cur.execute("UPDATE licenses SET disabled=0 WHERE code=%s", (code.upper(),))
+            cur.execute("SELECT note FROM licenses WHERE code=%s", (code.upper(),))
+            row = cur.fetchone()
+        finally:
+            conn.close()
+        note = row.get("note") or "—" if row else "—"
+        await ctx.send(f"✅ Unbanned `{code.upper()}` ({note})")
+
+    @bot.command(name="lookup")
+    async def cmd_lookup(ctx, code: str = ""):
+        if not _check(ctx): return
+        if not code: await ctx.send("Usage: `!lookup <CODE>`"); return
+        conn, cur = db()
+        try:
+            cur.execute("SELECT * FROM licenses WHERE code=%s", (code.upper(),))
+            row = cur.fetchone()
+        finally:
+            conn.close()
+        if not row:
+            await ctx.send(f"❌ Code `{code.upper()}` not found"); return
+        status = "DISABLED" if row["disabled"] else ("EXPIRED" if row.get("expires_at") and datetime.utcnow() > datetime.fromisoformat(row["expires_at"]) else ("ACTIVE" if row["hwid"] else "UNUSED"))
+        embed = discord.Embed(title=f"🔍 {code.upper()}", color=0x4fc3f7,
+            description=(
+                f"**Status:** {status}\n"
+                f"**User:** {row.get('note') or '—'}\n"
+                f"**HWID:** `{(row.get('hwid') or '—')[:20]}{'...' if row.get('hwid') else ''}`\n"
+                f"**Expires:** {row.get('expires_at') or 'Lifetime'}\n"
+                f"**Hours played:** {round((row.get('total_seconds') or 0)/3600,1)}h"
+            ))
+        await ctx.send(embed=embed)
+
+    @bot.command(name="online")
+    async def cmd_online(ctx):
+        if not _check(ctx): return
+        conn, cur = db()
+        try:
+            cutoff = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+            cur.execute("SELECT note, hwid, last_seen FROM licenses WHERE last_seen > %s AND hwid IS NOT NULL", (cutoff,))
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+        if not rows:
+            await ctx.send("No users online right now."); return
+        lines = "\n".join(f"• {r.get('note') or r['hwid'][:14]+'...'}" for r in rows)
+        embed = discord.Embed(title=f"🟢 {len(rows)} Online", color=0x2ecc71, description=lines)
+        await ctx.send(embed=embed)
+
+    @bot.command(name="dm")
+    async def cmd_dm(ctx, target: str = "", *, message: str = ""):
+        if not _check(ctx): return
+        if not target or not message: await ctx.send("Usage: `!dm <note_or_hwid> <message>`"); return
+        conn, cur = db()
+        try:
+            cur.execute("SELECT hwid FROM licenses WHERE LOWER(note)=LOWER(%s) OR hwid=UPPER(%s)", (target, target))
+            row = cur.fetchone()
+            if not row or not row["hwid"]:
+                await ctx.send(f"❌ User `{target}` not found"); return
+            cur.execute("INSERT INTO user_messages(hwid, message, created_at) VALUES(%s,%s,%s)",
+                        (row["hwid"], message, datetime.utcnow().isoformat()))
+        finally:
+            conn.close()
+        await ctx.send(f"📩 Message queued for **{target}**")
+
+    asyncio.run(bot.start(DISCORD_BOT_TOKEN))
+
+if DISCORD_BOT_TOKEN:
+    threading.Thread(target=_start_discord_bot, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
