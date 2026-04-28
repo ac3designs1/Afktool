@@ -910,10 +910,12 @@ async function generateCodes() {
 
 // Load overview on start
 console.log('Admin panel loaded, fetching data...');
-loadOverview().catch(e => {
+try {
+  loadOverview();
+} catch(e) {
   console.error('Failed to load overview:', e);
   document.getElementById('top-users').innerHTML = '<tr><td colspan="5" style="text-align:center;color:#ff8899">Failed to load data. Check database connection.</td></tr>';
-});
+}
 setInterval(loadOverview, 30000);
 </script></body></html>"""
 
