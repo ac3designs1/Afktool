@@ -804,21 +804,22 @@ textarea{resize:vertical}
         <div class="input-row">
           <input type="number" id="code-qty" value="1" min="1" max="100" style="width:60px" placeholder="Qty">
           <input type="text" id="code-note" placeholder="Username / note" style="flex:1;min-width:120px">
-          <select id="code-expires" title="Expiry from generation date">
-            <option value="">Lifetime</option>
-            <option value="1">1 Day</option>
-            <option value="7">7 Days</option>
-            <option value="30">30 Days</option>
-            <option value="90">90 Days</option>
-            <option value="365">1 Year</option>
-          </select>
-          <select id="code-trial" title="Trial: expiry starts from first activation">
-            <option value="">No Trial</option>
-            <option value="1">Trial 1h</option>
-            <option value="6">Trial 6h</option>
-            <option value="24">Trial 24h</option>
-            <option value="72">Trial 3 days</option>
-            <option value="168">Trial 7 days</option>
+          <select id="code-expiry" title="Expiry mode">
+            <option value="lifetime:">Lifetime</option>
+            <optgroup label="── Fixed (from now) ──">
+              <option value="days:1">1 Day</option>
+              <option value="days:7">7 Days</option>
+              <option value="days:30">30 Days</option>
+              <option value="days:90">90 Days</option>
+              <option value="days:365">1 Year</option>
+            </optgroup>
+            <optgroup label="── Trial (from activation) ──">
+              <option value="trial:1">Trial 1h</option>
+              <option value="trial:6">Trial 6h</option>
+              <option value="trial:24">Trial 24h</option>
+              <option value="trial:72">Trial 3 Days</option>
+              <option value="trial:168">Trial 7 Days</option>
+            </optgroup>
           </select>
           <button class="btn btn-primary" id="gen-btn">Generate</button>
         </div>
@@ -1147,11 +1148,13 @@ function renderCodes(d){
 document.getElementById('gen-btn').addEventListener('click', async()=>{
   const qty=parseInt(document.getElementById('code-qty').value)||1;
   const note=document.getElementById('code-note').value.trim();
-  const days=document.getElementById('code-expires').value;
-  const trial=document.getElementById('code-trial').value;
+  const expiry=document.getElementById('code-expiry').value;
+  const [expType, expVal]=expiry.split(':');
+  const expires_days = expType==='days' ? expVal : null;
+  const trial_hours  = expType==='trial' ? expVal : null;
   if(qty<1||qty>100){ toast('Qty must be 1–100'); return; }
   const r=await api('/generate',{admin_key:KEY,count:qty,note,
-    expires_days:days||null, trial_hours:trial||null});
+    expires_days, trial_hours});
   if(!r.ok){ toast('Error: '+(r.error||'?')); return; }
   toast('✓ Generated '+r.codes.length+' code(s)');
   if(r.codes.length===1){ navigator.clipboard.writeText(r.codes[0]); toast('✓ Copied: '+r.codes[0]); }
