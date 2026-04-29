@@ -2,7 +2,7 @@
 License Server v3 — PostgreSQL (data persists across restarts)
 Built on v2 (known-good) + advanced admin panel endpoints
 """
-import os, secrets, string, psycopg2, psycopg2.extras, threading, urllib.request, json
+import os, secrets, string, psycopg2, psycopg2.extras, threading, urllib.request, json, time
 from datetime import datetime, timedelta, timezone
 
 def utcnow():
