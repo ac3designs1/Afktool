@@ -1495,6 +1495,9 @@ def _start_discord_bot():
                 "`!msg all <text>` — Broadcast to all online users\n"
                 "`!msg <name> <text>` — In-app DM to one user\n"
                 "`!dm <name> <text>` — Same as above\n\n"
+                "**Channel**\n"
+                "`!clear` — Delete all messages in this channel\n"
+                "`!clear <n>` — Delete last N messages\n\n"
                 f"*{roles_note}*"
             ))
         await ctx.send(embed=embed)
@@ -1954,6 +1957,20 @@ def _start_discord_bot():
             await ctx.send(f"🔗 **{note}** — Discord updated from <@{old_id}> → {link_user.mention}")
         else:
             await ctx.send(f"🔗 **{note}** (`{code}`) — Discord linked to {link_user.mention}")
+
+    # ── !clear ─────────────────────────────────────────────────────────────────
+    @bot.command(name="clear")
+    async def cmd_clear(ctx, amount: str = "all"):
+        if not await _guard(ctx): return
+        try:
+            if amount.lower() == "all":
+                deleted = await ctx.channel.purge(limit=None)
+            else:
+                limit = int(amount)
+                deleted = await ctx.channel.purge(limit=limit)
+            confirm = await ctx.send(f"🗑️ Deleted **{len(deleted)}** message(s).", delete_after=5)
+        except Exception as e:
+            await ctx.send(f"❌ Failed to clear: {e}", delete_after=8)
 
     # ── !msg all ───────────────────────────────────────────────────────────────
     @bot.command(name="msg")
