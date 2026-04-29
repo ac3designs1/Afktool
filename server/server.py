@@ -14,6 +14,23 @@ ADMIN_KEY           = os.environ.get("ADMIN_KEY", "CHANGE_ME")
 DATABASE_URL        = os.environ.get("DATABASE_URL", "")
 CURRENT_VERSION     = os.environ.get("APP_VERSION", "1.0.0")
 DOWNLOAD_URL        = os.environ.get("DOWNLOAD_URL", "")
+
+def _load_persisted_settings():
+    """Load version + download URL overrides stored via admin panel."""
+    global CURRENT_VERSION, DOWNLOAD_URL
+    try:
+        conn, cur = db()
+        cur.execute("SELECT key, value FROM bot_state WHERE key IN ('app_version','download_url')")
+        for row in cur.fetchall():
+            if row["key"] == "app_version" and row["value"]:
+                CURRENT_VERSION = row["value"]
+            elif row["key"] == "download_url" and row["value"]:
+                DOWNLOAD_URL = row["value"]
+        conn.close()
+    except Exception:
+        pass
+
+_load_persisted_settings()
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 DISCORD_BOT_TOKEN   = os.environ.get("DISCORD_BOT_TOKEN", "")
 DISCORD_CHANNEL_ID  = int(os.environ.get("DISCORD_CHANNEL_ID", "0") or 0)
@@ -429,9 +446,21 @@ def client_event():
 def set_version():
     data = request.json or {}
     if not _auth(data): return jsonify(ok=False), 401
-    global CURRENT_VERSION
-    CURRENT_VERSION = (data.get("version") or "").strip() or CURRENT_VERSION
-    return jsonify(ok=True, current_version=CURRENT_VERSION)
+    global CURRENT_VERSION, DOWNLOAD_URL
+    new_ver = (data.get("version") or "").strip()
+    new_url = (data.get("download_url") or "").strip()
+    if new_ver or new_url:
+        conn, cur = db()
+        try:
+            if new_ver:
+                CURRENT_VERSION = new_ver
+                cur.execute("INSERT INTO bot_state(key,value) VALUES('app_version',%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", (new_ver,))
+            if new_url:
+                DOWNLOAD_URL = new_url
+                cur.execute("INSERT INTO bot_state(key,value) VALUES('download_url',%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", (new_url,))
+        finally:
+            conn.close()
+    return jsonify(ok=True, current_version=CURRENT_VERSION, download_url=DOWNLOAD_URL or None)
 
 # ---------------------------------------------------------------------------
 # Advanced admin endpoints (new — used by the sidebar admin panel)
@@ -897,12 +926,19 @@ textarea{resize:vertical}
       <div class="page-header"><h2>Settings</h2></div>
       <div class="card">
         <div class="card-title">Server Version</div>
-        <p class="muted" style="margin-bottom:12px;font-size:12px">Set the current app version. Clients running a different version will be flagged as VERSION_OLD in logs.</p>
-        <div class="input-row">
+        <p class="muted" style="margin-bottom:12px;font-size:12px">Set the current app version and download URL. Clients on an older version will auto-download the new exe.</p>
+        <div class="input-row" style="margin-bottom:8px">
           <input type="text" id="set-version-input" placeholder="e.g. 1.2.0" style="flex:1;max-width:200px">
-          <button class="btn btn-primary" id="set-version-btn">Update Version</button>
+          <button class="btn btn-primary" id="set-version-btn">Save</button>
         </div>
-        <p style="font-size:12px">Current: <strong id="current-version-display" style="color:#e94560">—</strong></p>
+        <div class="input-row">
+          <input type="text" id="set-dlurl-input" placeholder="https://… direct link to afktool.exe" style="flex:1">
+        </div>
+        <p style="font-size:12px;margin-top:10px">
+          Version: <strong id="current-version-display" style="color:#e94560">—</strong>
+          &nbsp;&nbsp;|&nbsp;&nbsp;
+          Download URL: <strong id="current-dlurl-display" style="color:#4fc3f7;word-break:break-all">—</strong>
+        </p>
       </div>
       <div class="card">
         <div class="card-title">Database Status</div>
@@ -1279,15 +1315,24 @@ async function loadSettings(){
     document.getElementById('current-version-display').textContent=r.current_version;
     document.getElementById('set-version-input').placeholder='e.g. '+r.current_version;
   }
+  // Load persisted download URL
+  const r2=await api('/set_version',{admin_key:KEY});
+  if(r2.download_url){
+    document.getElementById('current-dlurl-display').textContent=r2.download_url;
+    document.getElementById('set-dlurl-input').placeholder=r2.download_url;
+  }
 }
 document.getElementById('set-version-btn').addEventListener('click', async()=>{
   const v=document.getElementById('set-version-input').value.trim();
-  if(!v){ toast('Enter a version string'); return; }
-  const r=await api('/set_version',{admin_key:KEY,version:v});
+  const u=document.getElementById('set-dlurl-input').value.trim();
+  if(!v && !u){ toast('Enter a version and/or download URL'); return; }
+  const r=await api('/set_version',{admin_key:KEY,version:v,download_url:u});
   if(r.ok){
-    document.getElementById('current-version-display').textContent=r.current_version;
-    toast('✓ Version updated to '+r.current_version);
+    if(r.current_version) document.getElementById('current-version-display').textContent=r.current_version;
+    if(r.download_url)    document.getElementById('current-dlurl-display').textContent=r.download_url;
+    toast('✓ Saved');
     document.getElementById('set-version-input').value='';
+    document.getElementById('set-dlurl-input').value='';
   } else toast('Error: '+(r.error||'?'));
 });
 
