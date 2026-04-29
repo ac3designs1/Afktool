@@ -1910,7 +1910,9 @@ def _start_discord_bot():
 
         conn, cur = db()
         try:
-            code, row = _resolve_license(cur, target, ctx.message.mentions)
+            # Pass empty mentions so _resolve_license uses `target` (the license),
+            # not the @mention which is the Discord user we're linking
+            code, row = _resolve_license(cur, target, [])
             if not row:
                 await ctx.send(f"❌ No license found for `{target}`")
                 return
