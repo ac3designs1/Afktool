@@ -1461,7 +1461,8 @@ def _start_discord_bot():
                 "**Generating**\n"
                 "`!gen @user [days]` — Generate a code and DM it\n"
                 "`!trial @user <hours>` — Trial code DMed to user\n"
-                "`!dmcode <@user|code|name>` — Re-DM code to user\n\n"
+                "`!dmcode <@user|code|name>` — Re-DM code to user\n"
+                "`!linkdiscord <code|name> @user` — Link Discord ID to a key\n\n"
                 "**Managing**\n"
                 "`!ban / !unban / !revoke <@user|code|name>`\n"
                 "`!extend <@user|code|name> <days>` — Add days to expiry\n"
@@ -1879,6 +1880,51 @@ def _start_discord_bot():
             await ctx.send(f"📩 Code DMed to {discord_target.mention}")
         else:
             await ctx.send(f"⚠️ Couldn't DM {discord_target.mention} — their DMs may be closed")
+
+    # ── !linkdiscord ───────────────────────────────────────────────────────────
+    @bot.command(name="linkdiscord")
+    async def cmd_linkdiscord(ctx, target: str = "", discord_target: str = ""):
+        """Link a Discord user to a license key.
+        Usage: !linkdiscord <code|name> @user
+               !linkdiscord <code|name> <discord_id>
+        """
+        if not await _guard(ctx): return
+        if not target:
+            await ctx.send("Usage: `!linkdiscord <code|name> @user` or `!linkdiscord <code|name> <discord_id>`")
+            return
+
+        mention_user = ctx.message.mentions[0] if ctx.message.mentions else None
+
+        # Resolve the Discord user to link
+        link_user = mention_user
+        if not link_user and discord_target:
+            try:
+                link_user = await bot.fetch_user(int(discord_target))
+            except Exception:
+                await ctx.send(f"❌ Could not find Discord user `{discord_target}`")
+                return
+
+        if not link_user:
+            await ctx.send("❌ You must specify a Discord user via @mention or their Discord ID.")
+            return
+
+        conn, cur = db()
+        try:
+            code, row = _resolve_license(cur, target, ctx.message.mentions)
+            if not row:
+                await ctx.send(f"❌ No license found for `{target}`")
+                return
+            old_id = row.get("discord_id")
+            cur.execute("UPDATE licenses SET discord_id=%s WHERE code=%s",
+                        (str(link_user.id), code))
+        finally:
+            conn.close()
+
+        note = row.get("note") or code
+        if old_id and old_id != str(link_user.id):
+            await ctx.send(f"🔗 **{note}** — Discord updated from <@{old_id}> → {link_user.mention}")
+        else:
+            await ctx.send(f"🔗 **{note}** — Discord linked to {link_user.mention} (`{link_user.id}`)")
 
     # ── !msg all ───────────────────────────────────────────────────────────────
     @bot.command(name="msg")
