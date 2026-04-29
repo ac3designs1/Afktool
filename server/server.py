@@ -713,6 +713,32 @@ textarea{resize:vertical}
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:#080c1f}
 ::-webkit-scrollbar-thumb{background:#1e2d4a;border-radius:3px}
+/* ---- Mobile top bar ---- */
+.mobile-topbar{display:none;align-items:center;gap:12px;padding:10px 16px;background:#0d1225;border-bottom:1px solid #1a2540;position:sticky;top:0;z-index:100}
+.hamburger{background:none;border:none;color:#e0e6ff;font-size:22px;cursor:pointer;padding:0;border-radius:6px;min-height:44px;min-width:44px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.hamburger:hover{background:#151e38}
+.mobile-topbar-title{color:#e94560;font-size:16px;font-weight:700;flex:1}
+.sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:150}
+.sidebar-overlay.show{display:block}
+/* ---- Mobile breakpoint ---- */
+@media(max-width:767px){
+  .layout{flex-direction:column;height:auto;overflow:visible}
+  .mobile-topbar{display:flex}
+  .sidebar{position:fixed;left:-260px;top:0;bottom:0;z-index:200;width:240px;transition:left .25s ease;overflow-y:auto;height:100%}
+  .sidebar.open{left:0}
+  .main{flex:1;width:100%;padding:16px;overflow-y:auto}
+  .nav{min-height:44px;padding:10px 14px}
+  .btn{min-height:44px;padding:10px 14px}
+  .btn-sm{min-height:36px;padding:7px 12px}
+  .page-header{flex-wrap:wrap;gap:8px;margin-bottom:16px}
+  .stat-grid{grid-template-columns:repeat(2,1fr);gap:10px}
+  .input-row{flex-wrap:wrap}
+  .modal{width:100%;max-width:100%;min-height:100dvh;border-radius:0;border-left:none;border-right:none;border-bottom:none;margin:0}
+  .modal-bg{align-items:flex-start}
+  .modal-stat-grid{grid-template-columns:repeat(2,1fr)}
+  .log-entry{grid-template-columns:1fr;gap:3px}
+  .toast{left:16px;right:16px;bottom:16px;text-align:center}
+}
 </style></head><body>
 
 <!-- LOGIN -->
@@ -727,7 +753,8 @@ textarea{resize:vertical}
 
 <!-- APP -->
 <div id="app" class="layout hide">
-  <div class="sidebar">
+  <div class="sidebar-overlay" id="sidebar-overlay"></div>
+  <div class="sidebar" id="sidebar">
     <div class="sidebar-header">
       <h2>🚀 AntiAFK</h2>
       <p>Admin Console</p>
@@ -747,6 +774,10 @@ textarea{resize:vertical}
   </div>
 
   <div class="main">
+    <div class="mobile-topbar">
+      <button class="hamburger" id="hamburger-btn" aria-label="Open menu">&#9776;</button>
+      <span class="mobile-topbar-title">&#128640; AntiAFK</span>
+    </div>
 
     <!-- OVERVIEW -->
     <div id="tab-overview" class="tab-page">
@@ -1395,6 +1426,24 @@ setInterval(()=>{
   if(t.dataset.tab==='overview') loadOverview();
   else if(t.dataset.tab==='codes') loadCodes();
 }, 30000);
+
+// ── Mobile sidebar ──
+function isMobile(){ return window.innerWidth<768; }
+function openSidebar(){
+  document.getElementById('sidebar').classList.add('open');
+  document.getElementById('sidebar-overlay').classList.add('show');
+}
+function closeSidebar(){
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebar-overlay').classList.remove('show');
+}
+document.getElementById('hamburger-btn').addEventListener('click', openSidebar);
+document.getElementById('sidebar-overlay').addEventListener('click', closeSidebar);
+// Close sidebar when a nav item is tapped on mobile
+document.querySelectorAll('.nav[data-tab]').forEach(n=>{
+  n.addEventListener('click',()=>{ if(isMobile()) closeSidebar(); });
+});
+document.getElementById('logout-btn').addEventListener('click',()=>{ if(isMobile()) closeSidebar(); });
 </script></body></html>"""
 
 @app.get("/admin")
