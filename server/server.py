@@ -1409,11 +1409,13 @@ _BOT_LOCK_DEFERRED = False  # True when another worker already owns the bot
 
 def _start_discord_bot():
     global _BOT_LOCK_DEFERRED
-    # Use a PostgreSQL advisory lock so only ONE worker process runs the bot.
-    # If another worker already holds the lock, exit immediately.
+    # Use a PostgreSQL advisory lock so only ONE Gunicorn worker runs the bot.
     _lock_conn = None
     try:
         _lock_conn, _lock_cur = db()
+        # Release any stale lock this session already holds before trying again
+        try: _lock_cur.execute("SELECT pg_advisory_unlock(777333111)")
+        except Exception: pass
         _lock_cur.execute("SELECT pg_try_advisory_lock(777333111)")
         acquired = (_lock_cur.fetchone() or {}).get("pg_try_advisory_lock", False)
         if not acquired:
@@ -1422,7 +1424,7 @@ def _start_discord_bot():
             print("[Discord] Advisory lock held by another worker — bot not started here")
             return
         _BOT_LOCK_DEFERRED = False
-        # Keep _lock_conn open to hold the lock for the lifetime of this thread
+        print("[Discord] Advisory lock acquired — starting bot")
     except Exception as e:
         print(f"[Discord] Could not acquire advisory lock: {e}")
         if _lock_conn:
@@ -2211,23 +2213,33 @@ def _start_discord_bot():
             return
         await ctx.send(f"❌ Error: {error}", delete_after=8)
 
-    asyncio.run(bot.start(DISCORD_BOT_TOKEN))
+    try:
+        print("[Discord] bot.start() running…")
+        asyncio.run(bot.start(DISCORD_BOT_TOKEN))
+        print("[Discord] bot.start() returned cleanly")
+    except Exception as e:
+        print(f"[Discord] bot.start() raised: {e!r}")
+    finally:
+        # Explicitly release advisory lock so supervisor can re-acquire immediately
+        try:
+            _lock_conn.close()
+            print("[Discord] advisory lock released")
+        except Exception:
+            pass
 
 def _bot_supervisor():
-    """Outer supervisor: restarts the entire bot setup (including re-registering
-    all commands/tasks) whenever it crashes or disconnects fatally.
-    Does NOT restart if another worker legitimately holds the lock."""
+    """Restarts the entire bot (re-registers all commands/tasks on a fresh event
+    loop) whenever bot.start() exits for any reason."""
     while True:
         try:
             _start_discord_bot()
         except Exception as e:
-            print(f"[Discord] bot crashed ({e!r}), restarting in 30s…")
-        # If another worker owns the bot, check again in 60s in case that
-        # worker dies and releases the lock
+            print(f"[Discord] supervisor caught unexpected error: {e!r}")
         if _BOT_LOCK_DEFERRED:
+            # Another worker owns the bot — poll every 60s in case it dies
             time.sleep(60)
         else:
-            print("[Discord] bot exited, restarting in 30s…")
+            print("[Discord] supervisor waiting 30s before restart…")
             time.sleep(30)
 
 if DISCORD_BOT_TOKEN:
