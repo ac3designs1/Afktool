@@ -1405,7 +1405,10 @@ def admin_page():
 # Discord bot (optional — only starts if DISCORD_BOT_TOKEN is set)
 # ---------------------------------------------------------------------------
 
+_BOT_LOCK_DEFERRED = False  # True when another worker already owns the bot
+
 def _start_discord_bot():
+    global _BOT_LOCK_DEFERRED
     # Use a PostgreSQL advisory lock so only ONE worker process runs the bot.
     # If another worker already holds the lock, exit immediately.
     _lock_conn = None
@@ -1415,8 +1418,10 @@ def _start_discord_bot():
         acquired = (_lock_cur.fetchone() or {}).get("pg_try_advisory_lock", False)
         if not acquired:
             _lock_conn.close()
+            _BOT_LOCK_DEFERRED = True
             print("[Discord] Advisory lock held by another worker — bot not started here")
             return
+        _BOT_LOCK_DEFERRED = False
         # Keep _lock_conn open to hold the lock for the lifetime of this thread
     except Exception as e:
         print(f"[Discord] Could not acquire advisory lock: {e}")
@@ -2208,8 +2213,25 @@ def _start_discord_bot():
 
     asyncio.run(bot.start(DISCORD_BOT_TOKEN))
 
+def _bot_supervisor():
+    """Outer supervisor: restarts the entire bot setup (including re-registering
+    all commands/tasks) whenever it crashes or disconnects fatally.
+    Does NOT restart if another worker legitimately holds the lock."""
+    while True:
+        try:
+            _start_discord_bot()
+        except Exception as e:
+            print(f"[Discord] bot crashed ({e!r}), restarting in 30s…")
+        # If another worker owns the bot, check again in 60s in case that
+        # worker dies and releases the lock
+        if _BOT_LOCK_DEFERRED:
+            time.sleep(60)
+        else:
+            print("[Discord] bot exited, restarting in 30s…")
+            time.sleep(30)
+
 if DISCORD_BOT_TOKEN:
-    threading.Thread(target=_start_discord_bot, daemon=True).start()
+    threading.Thread(target=_bot_supervisor, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
