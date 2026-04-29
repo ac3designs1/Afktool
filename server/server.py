@@ -1420,19 +1420,34 @@ def _start_discord_bot():
     def _resolve_license(cur, target, mentions):
         """
         Resolve a license row from either:
-          - A Discord @mention  → match by note (display name)
+          - A Discord @mention  → match by discord_id first, then display name
           - A FIVEM-... code    → match by code
-          - A plain name        → match by note
+          - A plain name        → match by note (exact, then partial)
         Returns (code, row) or (None, None).
         """
+        row = None
         if mentions:
-            name = mentions[0].display_name
-            cur.execute("SELECT * FROM licenses WHERE LOWER(note)=LOWER(%s)", (name,))
+            member = mentions[0]
+            # Try discord_id first (most reliable)
+            cur.execute("SELECT * FROM licenses WHERE discord_id=%s", (str(member.id),))
+            row = cur.fetchone()
+            # Fall back to display name match
+            if not row:
+                cur.execute("SELECT * FROM licenses WHERE LOWER(note)=LOWER(%s)", (member.display_name,))
+                row = cur.fetchone()
+            # Fall back to username match
+            if not row:
+                cur.execute("SELECT * FROM licenses WHERE LOWER(note)=LOWER(%s)", (member.name,))
+                row = cur.fetchone()
         elif target.upper().startswith("FIVEM-"):
-            cur.execute("SELECT * FROM licenses WHERE code=%s", (target.upper(),))
+            cur.execute("SELECT * FROM licenses WHERE UPPER(code)=UPPER(%s)", (target,))
+            row = cur.fetchone()
         else:
             cur.execute("SELECT * FROM licenses WHERE LOWER(note)=LOWER(%s)", (target,))
-        row = cur.fetchone()
+            row = cur.fetchone()
+            if not row:
+                cur.execute("SELECT * FROM licenses WHERE LOWER(note) LIKE LOWER(%s) LIMIT 1", (f"%{target}%",))
+                row = cur.fetchone()
         if not row:
             return None, None
         return row.get("code"), row
