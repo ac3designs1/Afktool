@@ -48,6 +48,9 @@ def db():
     cur.execute("""CREATE TABLE IF NOT EXISTS active_sessions (
         hwid TEXT PRIMARY KEY, started_at TEXT, last_seen TEXT
     )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS bot_state (
+        key TEXT PRIMARY KEY, value TEXT
+    )""")
     return conn, cur
 
 def _log(cur, hwid, event_type, details, ip=""):
@@ -921,7 +924,7 @@ let userFilter = 'all';
 const EV = {
   SESSION_START:'#2ecc71', SESSION_END:'#27ae60', ACTIVATE:'#4fc3f7',
   AFK_TRIGGERED:'#e67e22', AFK_LOOP_START:'#f39c12', AFK_LOOP_STOP:'#d35400',
-  GAME_DETECTED:'#1abc9c', GAME_LOST:'#e74c3c',
+  GAME_DETECTED:'#1abc9c', GAME_LOST:'#e74c3c', GAME_CRASH:'#e74c3c',
   CIRCLE_DETECTED:'#9b59b6', CIRCLE_MISSED:'#8e44ad',
   BLOCKED:'#ff6b81', EXPIRED:'#f1c40f', VERSION_OLD:'#e67e22',
   BAN:'#e74c3c', UNBAN:'#2ecc71', HWID_RESET:'#9b59b6',
@@ -1350,11 +1353,33 @@ def admin_page():
 # ---------------------------------------------------------------------------
 
 def _start_discord_bot():
+    # Use a PostgreSQL advisory lock so only ONE worker process runs the bot.
+    # If another worker already holds the lock, exit immediately.
+    _lock_conn = None
+    try:
+        _lock_conn, _lock_cur = db()
+        _lock_cur.execute("SELECT pg_try_advisory_lock(777333111)")
+        acquired = (_lock_cur.fetchone() or {}).get("pg_try_advisory_lock", False)
+        if not acquired:
+            _lock_conn.close()
+            print("[Discord] Advisory lock held by another worker — bot not started here")
+            return
+        # Keep _lock_conn open to hold the lock for the lifetime of this thread
+    except Exception as e:
+        print(f"[Discord] Could not acquire advisory lock: {e}")
+        if _lock_conn:
+            try: _lock_conn.close()
+            except: pass
+        return
+
     try:
         import asyncio, discord
         from discord.ext import commands as dc_commands
     except ImportError:
         print("[Discord] discord.py not installed — bot disabled")
+        if _lock_conn:
+            try: _lock_conn.close()
+            except: pass
         return
 
     # Comma-separated role names that are allowed to use commands, e.g. "Admin,Staff"
@@ -1871,31 +1896,40 @@ def _start_discord_bot():
             description="\n".join(lines))
         await ch.send(embed=embed)
 
-    _last_activation_check = {"ts": utcnow().isoformat()}
-
     @tasks.loop(seconds=30)
     async def activation_watch():
-        """Alert when a new activation happens."""
+        """Alert when a new activation happens. Uses DB to track last-seen ts."""
         if DISCORD_CHANNEL_ID == 0: return
         ch = bot.get_channel(DISCORD_CHANNEL_ID)
         if not ch: return
         conn, cur = db()
         try:
+            # Read the high-water mark stored in the DB
+            cur.execute("SELECT value FROM bot_state WHERE key='last_activation_ts'")
+            row = cur.fetchone()
+            last_ts = row["value"] if row else utcnow().isoformat()
+
             cur.execute("""SELECT a.details, a.created_at, l.note
                            FROM activity_logs a
                            LEFT JOIN licenses l ON UPPER(l.hwid)=UPPER(a.hwid)
                            WHERE a.event_type='ACTIVATE' AND a.created_at > %s
-                           ORDER BY a.created_at ASC""", (_last_activation_check["ts"],))
+                           ORDER BY a.created_at ASC""", (last_ts,))
             rows = cur.fetchall()
+
+            for r in rows:
+                last_ts = r["created_at"]
+                name    = r.get("note") or "Unknown"
+                details = r.get("details") or ""
+                embed = discord.Embed(title="🔑 New Activation", color=0x2ecc71,
+                    description=f"**User:** {name}\n**Details:** {details}")
+                await ch.send(embed=embed)
+
+            # Persist high-water mark so restarts don't re-fire old events
+            if rows:
+                cur.execute("""INSERT INTO bot_state(key, value) VALUES('last_activation_ts', %s)
+                               ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value""", (last_ts,))
         finally:
             conn.close()
-        for r in rows:
-            _last_activation_check["ts"] = r["created_at"]
-            name = r.get("note") or "Unknown"
-            details = r.get("details") or ""
-            embed = discord.Embed(title="🔑 New Activation", color=0x2ecc71,
-                description=f"**User:** {name}\n**Details:** {details}")
-            await ch.send(embed=embed)
 
     # ── Update help text ───────────────────────────────────────────────────────
     @bot.event
