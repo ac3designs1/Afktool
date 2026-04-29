@@ -1909,13 +1909,25 @@ def _start_discord_bot():
             return
 
         conn, cur = db()
+        row = None
         try:
-            # Pass empty mentions so _resolve_license uses `target` (the license),
-            # not the @mention which is the Discord user we're linking
-            code, row = _resolve_license(cur, target, [])
+            # 1. Exact code match
+            cur.execute("SELECT * FROM licenses WHERE UPPER(code)=UPPER(%s)", (target,))
+            row = cur.fetchone()
+            # 2. Name/note match
+            if not row:
+                cur.execute("SELECT * FROM licenses WHERE LOWER(note)=LOWER(%s)", (target,))
+                row = cur.fetchone()
+            # 3. Partial name match
+            if not row:
+                cur.execute("SELECT * FROM licenses WHERE LOWER(note) LIKE LOWER(%s) LIMIT 1", (f"%{target}%",))
+                row = cur.fetchone()
+
             if not row:
                 await ctx.send(f"❌ No license found for `{target}`")
                 return
+
+            code = row["code"]
             old_id = row.get("discord_id")
             cur.execute("UPDATE licenses SET discord_id=%s WHERE code=%s",
                         (str(link_user.id), code))
@@ -1926,7 +1938,7 @@ def _start_discord_bot():
         if old_id and old_id != str(link_user.id):
             await ctx.send(f"🔗 **{note}** — Discord updated from <@{old_id}> → {link_user.mention}")
         else:
-            await ctx.send(f"🔗 **{note}** — Discord linked to {link_user.mention} (`{link_user.id}`)")
+            await ctx.send(f"🔗 **{note}** (`{code}`) — Discord linked to {link_user.mention}")
 
     # ── !msg all ───────────────────────────────────────────────────────────────
     @bot.command(name="msg")
