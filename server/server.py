@@ -1961,7 +1961,7 @@ def _start_discord_bot():
     # ── !clear ─────────────────────────────────────────────────────────────────
     @bot.command(name="clear")
     async def cmd_clear(ctx, amount: str = "all"):
-        if not await _guard(ctx): return
+        if not _allowed(ctx): return  # role check only, works in any channel
         try:
             if amount.lower() == "all":
                 deleted = await ctx.channel.purge(limit=None)
@@ -2015,7 +2015,7 @@ def _start_discord_bot():
 
     @tasks.loop(hours=12)
     async def expiry_check():
-        """Post in channel + DM users whose licenses expire within 3 days."""
+        """Post in channel + DM users whose licenses expire within 3 days."""  # noqa
         conn, cur = db()
         try:
             soon = (utcnow() + timedelta(days=3)).isoformat()
@@ -2074,58 +2074,85 @@ def _start_discord_bot():
     @tasks.loop(seconds=30)
     async def activation_watch():
         """Alert when a new activation happens. Uses DB to track last-seen ts."""
-        conn, cur = db()
         try:
-            # Read the stored high-water mark
-            cur.execute("SELECT value FROM bot_state WHERE key='last_activation_ts'")
-            brow = cur.fetchone()
-            if brow:
-                last_ts = brow["value"]
-            else:
-                # First ever run — seed the mark to now so we don't replay history
-                last_ts = utcnow().isoformat()
-                cur.execute("""INSERT INTO bot_state(key, value) VALUES('last_activation_ts', %s)
-                               ON CONFLICT(key) DO NOTHING""", (last_ts,))
+            conn, cur = db()
+            try:
+                # Read the stored high-water mark
+                cur.execute("SELECT value FROM bot_state WHERE key='last_activation_ts'")
+                brow = cur.fetchone()
+                if brow:
+                    last_ts = brow["value"]
+                else:
+                    # First ever run — seed the mark to now so we don't replay history
+                    last_ts = utcnow().isoformat()
+                    cur.execute("""INSERT INTO bot_state(key, value) VALUES('last_activation_ts', %s)
+                                   ON CONFLICT(key) DO NOTHING""", (last_ts,))
 
-            cur.execute("""SELECT a.details, a.created_at, l.note, l.code, l.discord_id
-                           FROM activity_logs a
-                           LEFT JOIN licenses l ON UPPER(l.hwid)=UPPER(a.hwid)
-                           WHERE a.event_type='ACTIVATE' AND a.created_at > %s
-                           ORDER BY a.created_at ASC""", (last_ts,))
-            rows = cur.fetchall()
+                cur.execute("""SELECT a.details, a.created_at, l.note, l.code, l.discord_id
+                               FROM activity_logs a
+                               LEFT JOIN licenses l ON UPPER(l.hwid)=UPPER(a.hwid)
+                               WHERE a.event_type='ACTIVATE' AND a.created_at > %s
+                               ORDER BY a.created_at ASC""", (last_ts,))
+                rows = cur.fetchall()
 
-            new_ts = last_ts
-            for r in rows:
-                new_ts = r["created_at"]
-                name   = r.get("note") or "Unknown"
-                details = r.get("details") or ""
+                new_ts = last_ts
+                for r in rows:
+                    # Always store as ISO string, never as datetime object
+                    row_ts = r["created_at"]
+                    if hasattr(row_ts, "isoformat"):
+                        row_ts = row_ts.isoformat()
+                    new_ts = row_ts
+                    name   = r.get("note") or "Unknown"
+                    details = r.get("details") or ""
 
-                # Post to channel if configured — prefer dedicated activation channel
-                act_ch_id = DISCORD_ACTIVATION_CHANNEL_ID or DISCORD_CHANNEL_ID
-                if act_ch_id != 0:
-                    ch = bot.get_channel(act_ch_id)
-                    if ch:
-                        embed = discord.Embed(title="🔑 New Activation", color=0x2ecc71,
-                            description=f"**User:** {name}\n**Details:** {details}")
-                        await ch.send(embed=embed)
+                    # Post to channel — prefer dedicated activation channel
+                    act_ch_id = DISCORD_ACTIVATION_CHANNEL_ID or DISCORD_CHANNEL_ID
+                    if act_ch_id != 0:
+                        ch = bot.get_channel(act_ch_id)
+                        if ch:
+                            embed = discord.Embed(title="🔑 New Activation", color=0x2ecc71,
+                                description=f"**User:** {name}\n**Details:** {details}")
+                            await ch.send(embed=embed)
 
-                # DM the user their code if we have their Discord ID
-                if r.get("discord_id") and r.get("code"):
-                    try:
-                        user = await bot.fetch_user(int(r["discord_id"]))
-                        cur.execute("SELECT expires_at FROM licenses WHERE code=%s", (r["code"],))
-                        exp_row = cur.fetchone()
-                        exp_str = (exp_row["expires_at"][:10] if exp_row and exp_row.get("expires_at") else "Lifetime")
-                        await _dm_code(user, r["code"], exp_str, name)
-                    except Exception:
-                        pass
+                    # DM the user their code if we have their Discord ID
+                    if r.get("discord_id") and r.get("code"):
+                        try:
+                            user = await bot.fetch_user(int(r["discord_id"]))
+                            conn2, cur2 = db()
+                            try:
+                                cur2.execute("SELECT expires_at FROM licenses WHERE code=%s", (r["code"],))
+                                exp_row = cur2.fetchone()
+                            finally:
+                                conn2.close()
+                            exp_str = (exp_row["expires_at"][:10] if exp_row and exp_row.get("expires_at") else "Lifetime")
+                            await _dm_code(user, r["code"], exp_str, name)
+                        except Exception:
+                            pass
 
-            # Always advance the mark so the next run doesn't re-check old events
-            if new_ts != last_ts:
-                cur.execute("""INSERT INTO bot_state(key, value) VALUES('last_activation_ts', %s)
-                               ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value""", (new_ts,))
-        finally:
-            conn.close()
+                # Always advance the mark so the next run doesn't re-check old events
+                if new_ts != last_ts:
+                    cur.execute("""INSERT INTO bot_state(key, value) VALUES('last_activation_ts', %s)
+                                   ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value""", (new_ts,))
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"[activation_watch] error: {e}")
+
+    @activation_watch.before_loop
+    async def before_activation_watch():
+        await bot.wait_until_ready()
+
+    @expiry_check.before_loop
+    async def before_expiry_check():
+        await bot.wait_until_ready()
+
+    @activation_watch.error
+    async def activation_watch_error(error):
+        print(f"[activation_watch] task error: {error}")
+
+    @expiry_check.error
+    async def expiry_check_error(error):
+        print(f"[expiry_check] task error: {error}")
 
     # ── Update help text ───────────────────────────────────────────────────────
     @bot.event
