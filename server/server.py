@@ -35,6 +35,7 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 DISCORD_BOT_TOKEN   = os.environ.get("DISCORD_BOT_TOKEN", "")
 DISCORD_CHANNEL_ID  = int(os.environ.get("DISCORD_CHANNEL_ID", "0") or 0)
 DISCORD_ACTIVATION_CHANNEL_ID = int(os.environ.get("DISCORD_ACTIVATION_CHANNEL_ID", "0") or 0)
+DISCORD_ACCESS_ROLE = os.environ.get("DISCORD_ACCESS_ROLE", "")  # Role name to assign on !gen / !trial
 
 app = Flask(__name__)
 
@@ -1568,6 +1569,29 @@ def _start_discord_bot():
         except Exception:
             return False
 
+    async def _grant_access_role(ctx, member):
+        """Assign DISCORD_ACCESS_ROLE to member. Returns a status string."""
+        role_val = DISCORD_ACCESS_ROLE.strip()
+        if not role_val or not member or not ctx.guild:
+            return ""
+        # Support both role ID (numeric) and role name
+        if role_val.isdigit():
+            role = ctx.guild.get_role(int(role_val))
+        else:
+            role = discord.utils.find(lambda r: r.name.lower() == role_val.lower(), ctx.guild.roles)
+        role_name = role.name if role else role_val
+        if not role:
+            return f"\n⚠️ Role `{role_val}` not found in server"
+        if role in member.roles:
+            return f"\n✅ {member.mention} already has `{role_name}`"
+        try:
+            await member.add_roles(role, reason="!gen/!trial license issued")
+            return f"\n🎭 Role `{role_name}` assigned to {member.mention}"
+        except discord.Forbidden:
+            return f"\n⚠️ Missing permission to assign `{role_name}` (bot role too low?)"
+        except Exception as e:
+            return f"\n⚠️ Failed to assign role: {e}"
+
     @bot.command(name="help")
     async def cmd_help(ctx):
         if not await _guard(ctx): return
@@ -1627,14 +1651,16 @@ def _start_discord_bot():
 
         exp_str = f"{days} days" if days else "Lifetime"
 
-        # DM the mentioned user if there was a mention
+        # DM the mentioned user and assign role if there was a mention
         dm_status = ""
+        role_status = ""
         if mention_user:
             sent = await _dm_code(mention_user, c, exp_str, note)
             dm_status = f"\n📩 Code DMed to {mention_user.mention}" if sent else f"\n⚠️ Couldn't DM {mention_user.mention} (DMs may be closed)"
+            role_status = await _grant_access_role(ctx, mention_user)
 
         embed = discord.Embed(title="✅ Code Generated", color=0x2ecc71,
-            description=f"**Code:** `{c}`\n**User:** {note}\n**Expiry:** {exp_str}{dm_status}")
+            description=f"**Code:** `{c}`\n**User:** {note}\n**Expiry:** {exp_str}{dm_status}{role_status}")
         await ctx.send(embed=embed)
 
     @bot.command(name="trial")
@@ -1658,12 +1684,14 @@ def _start_discord_bot():
 
         exp_str = f"Trial {h}h (starts on activation)"
         dm_status = ""
+        role_status = ""
         if mention_user:
             sent = await _dm_code(mention_user, c, exp_str, note)
             dm_status = f"\n📩 Code DMed to {mention_user.mention}" if sent else f"\n⚠️ Couldn't DM {mention_user.mention} (DMs may be closed)"
+            role_status = await _grant_access_role(ctx, mention_user)
 
         embed = discord.Embed(title="⏱ Trial Code Generated", color=0xf39c12,
-            description=f"**Code:** `{c}`\n**User:** {note}\n**Trial:** {h}h from first activation{dm_status}")
+            description=f"**Code:** `{c}`\n**User:** {note}\n**Trial:** {h}h from first activation{dm_status}{role_status}")
         await ctx.send(embed=embed)
 
     @bot.command(name="revoke")
