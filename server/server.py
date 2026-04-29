@@ -17,6 +17,7 @@ DOWNLOAD_URL        = os.environ.get("DOWNLOAD_URL", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 DISCORD_BOT_TOKEN   = os.environ.get("DISCORD_BOT_TOKEN", "")
 DISCORD_CHANNEL_ID  = int(os.environ.get("DISCORD_CHANNEL_ID", "0") or 0)
+DISCORD_ACTIVATION_CHANNEL_ID = int(os.environ.get("DISCORD_ACTIVATION_CHANNEL_ID", "0") or 0)
 
 app = Flask(__name__)
 
@@ -51,6 +52,13 @@ def db():
     cur.execute("""CREATE TABLE IF NOT EXISTS bot_state (
         key TEXT PRIMARY KEY, value TEXT
     )""")
+    # Add columns introduced after initial deploy (safe to run on existing DBs)
+    for col_sql in [
+        "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS discord_id TEXT",
+        "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS expiry_dm_sent INTEGER DEFAULT 0",
+    ]:
+        try: cur.execute(col_sql)
+        except Exception: pass
     return conn, cur
 
 def _log(cur, hwid, event_type, details, ip=""):
@@ -1452,7 +1460,8 @@ def _start_discord_bot():
             description=(
                 "**Generating**\n"
                 "`!gen @user [days]` — Generate a code and DM it\n"
-                "`!trial @user <hours>` — Trial code DMed to user\n\n"
+                "`!trial @user <hours>` — Trial code DMed to user\n"
+                "`!dmcode <@user|code|name>` — Re-DM code to user\n\n"
                 "**Managing**\n"
                 "`!ban / !unban / !revoke <@user|code|name>`\n"
                 "`!extend <@user|code|name> <days>` — Add days to expiry\n"
@@ -1490,8 +1499,9 @@ def _start_discord_bot():
             if days:
                 try: expires = (utcnow() + timedelta(days=float(days))).isoformat()
                 except: pass
-            cur.execute("INSERT INTO licenses(code, created_at, note, expires_at) VALUES(%s,%s,%s,%s)",
-                        (c, utcnow().isoformat(), note, expires))
+            did = str(mention_user.id) if mention_user else None
+            cur.execute("INSERT INTO licenses(code, created_at, note, expires_at, discord_id) VALUES(%s,%s,%s,%s,%s)",
+                        (c, utcnow().isoformat(), note, expires, did))
         finally:
             conn.close()
 
@@ -1520,8 +1530,9 @@ def _start_discord_bot():
         conn, cur = db()
         try:
             c = gen_code()
-            cur.execute("INSERT INTO licenses(code, created_at, note, trial_hours) VALUES(%s,%s,%s,%s)",
-                        (c, utcnow().isoformat(), note, h))
+            did = str(mention_user.id) if mention_user else None
+            cur.execute("INSERT INTO licenses(code, created_at, note, trial_hours, discord_id) VALUES(%s,%s,%s,%s,%s)",
+                        (c, utcnow().isoformat(), note, h, did))
         finally:
             conn.close()
 
@@ -1680,7 +1691,11 @@ def _start_discord_bot():
             current = row.get("expires_at")
             base = max(datetime.fromisoformat(current), utcnow()) if current else utcnow()
             new_exp = (base + timedelta(days=d)).isoformat()
-            cur.execute("UPDATE licenses SET expires_at=%s WHERE code=%s", (new_exp, code))
+            # Reset expiry DM flag if new expiry is beyond the 3-day warning window
+            warn_threshold = (utcnow() + timedelta(days=3)).isoformat()
+            reset_dm = 1 if new_exp > warn_threshold else 0
+            cur.execute("UPDATE licenses SET expires_at=%s, expiry_dm_sent=%s WHERE code=%s",
+                        (new_exp, reset_dm, code))
         finally:
             conn.close()
         name = row.get("note") or code
@@ -1829,6 +1844,42 @@ def _start_discord_bot():
         embed.add_field(name="Expires", value=exp[:10] if exp != "Lifetime" else exp, inline=True)
         await ctx.send(embed=embed)
 
+    # ── !dmcode ────────────────────────────────────────────────────────────────
+    @bot.command(name="dmcode")
+    async def cmd_dmcode(ctx, target: str = ""):
+        if not await _guard(ctx): return
+        if not target: await ctx.send("Usage: `!dmcode <@user | code | name>`"); return
+        mention_user = ctx.message.mentions[0] if ctx.message.mentions else None
+        conn, cur = db()
+        try:
+            code, row = _resolve_license(cur, target, ctx.message.mentions)
+        finally:
+            conn.close()
+        if not row:
+            await ctx.send(f"❌ No license found for `{target}`"); return
+        exp = row.get("expires_at")
+        exp_str = exp[:10] if exp else "Lifetime"
+        # Try mention first, then stored discord_id
+        discord_target = mention_user
+        if not discord_target and row.get("discord_id"):
+            try: discord_target = await bot.fetch_user(int(row["discord_id"]))
+            except: pass
+        if not discord_target:
+            await ctx.send("❌ No Discord user linked to this license. Use `!dmcode @mention` to specify them."); return
+        sent = await _dm_code(discord_target, code, exp_str, row.get("note") or code)
+        if sent:
+            # Update discord_id if it wasn't set
+            if not row.get("discord_id"):
+                conn2, cur2 = db()
+                try:
+                    cur2.execute("UPDATE licenses SET discord_id=%s WHERE code=%s",
+                                 (str(discord_target.id), code))
+                finally:
+                    conn2.close()
+            await ctx.send(f"📩 Code DMed to {discord_target.mention}")
+        else:
+            await ctx.send(f"⚠️ Couldn't DM {discord_target.mention} — their DMs may be closed")
+
     # ── !msg all ───────────────────────────────────────────────────────────────
     @bot.command(name="msg")
     async def cmd_msg(ctx, target: str = "", *, message: str = ""):
@@ -1870,64 +1921,117 @@ def _start_discord_bot():
 
     import discord.ext.tasks as tasks
 
-    @tasks.loop(hours=24)
+    @tasks.loop(hours=12)
     async def expiry_check():
-        """Post in channel if any licenses expire within 3 days."""
-        if DISCORD_CHANNEL_ID == 0: return
-        ch = bot.get_channel(DISCORD_CHANNEL_ID)
-        if not ch: return
+        """Post in channel + DM users whose licenses expire within 3 days."""
         conn, cur = db()
         try:
-            soon  = (utcnow() + timedelta(days=3)).isoformat()
-            now   = utcnow().isoformat()
-            cur.execute("""SELECT note, code, expires_at FROM licenses
+            soon = (utcnow() + timedelta(days=3)).isoformat()
+            now  = utcnow().isoformat()
+            cur.execute("""SELECT note, code, expires_at, discord_id, expiry_dm_sent
+                           FROM licenses
                            WHERE expires_at IS NOT NULL AND expires_at > %s AND expires_at < %s
                            AND disabled=0 AND hwid IS NOT NULL""", (now, soon))
             rows = cur.fetchall()
         finally:
             conn.close()
+
         if not rows: return
-        lines = []
+
+        # Channel summary
+        if DISCORD_CHANNEL_ID != 0:
+            ch = bot.get_channel(DISCORD_CHANNEL_ID)
+            if ch:
+                lines = []
+                for r in rows:
+                    name = r.get("note") or r["code"]
+                    exp  = r["expires_at"][:10]
+                    lines.append(f"• **{name}** — expires `{exp}`")
+                embed = discord.Embed(title="⚠️ Licenses Expiring Soon", color=0xf39c12,
+                    description="\n".join(lines))
+                await ch.send(embed=embed)
+
+        # DM each user who has a discord_id and hasn't been warned yet
         for r in rows:
-            name = r.get("note") or r["code"]
-            exp  = r["expires_at"][:10]
-            lines.append(f"• **{name}** — expires `{exp}`")
-        embed = discord.Embed(title="⚠️ Licenses Expiring Soon", color=0xf39c12,
-            description="\n".join(lines))
-        await ch.send(embed=embed)
+            if r.get("expiry_dm_sent") or not r.get("discord_id"):
+                continue
+            try:
+                user = await bot.fetch_user(int(r["discord_id"]))
+                name = r.get("note") or r["code"]
+                exp  = r["expires_at"][:10]
+                days_left = max(0, (datetime.fromisoformat(r["expires_at"]) - utcnow()).days)
+                embed = discord.Embed(
+                    title="⚠️ Your License is Expiring Soon",
+                    color=0xf39c12,
+                    description=(
+                        f"Hey **{name}**, your FiveM AFK Tool license expires on `{exp}` "
+                        f"(**{days_left} day{'s' if days_left != 1 else ''}** left).\n\n"
+                        f"Contact an admin to renew before it expires."
+                    )
+                )
+                await user.send(embed=embed)
+                # Mark as warned
+                conn2, cur2 = db()
+                try:
+                    cur2.execute("UPDATE licenses SET expiry_dm_sent=1 WHERE code=%s", (r["code"],))
+                finally:
+                    conn2.close()
+            except Exception:
+                pass
 
     @tasks.loop(seconds=30)
     async def activation_watch():
         """Alert when a new activation happens. Uses DB to track last-seen ts."""
-        if DISCORD_CHANNEL_ID == 0: return
-        ch = bot.get_channel(DISCORD_CHANNEL_ID)
-        if not ch: return
         conn, cur = db()
         try:
-            # Read the high-water mark stored in the DB
+            # Read the stored high-water mark
             cur.execute("SELECT value FROM bot_state WHERE key='last_activation_ts'")
-            row = cur.fetchone()
-            last_ts = row["value"] if row else utcnow().isoformat()
+            brow = cur.fetchone()
+            if brow:
+                last_ts = brow["value"]
+            else:
+                # First ever run — seed the mark to now so we don't replay history
+                last_ts = utcnow().isoformat()
+                cur.execute("""INSERT INTO bot_state(key, value) VALUES('last_activation_ts', %s)
+                               ON CONFLICT(key) DO NOTHING""", (last_ts,))
 
-            cur.execute("""SELECT a.details, a.created_at, l.note
+            cur.execute("""SELECT a.details, a.created_at, l.note, l.code, l.discord_id
                            FROM activity_logs a
                            LEFT JOIN licenses l ON UPPER(l.hwid)=UPPER(a.hwid)
                            WHERE a.event_type='ACTIVATE' AND a.created_at > %s
                            ORDER BY a.created_at ASC""", (last_ts,))
             rows = cur.fetchall()
 
+            new_ts = last_ts
             for r in rows:
-                last_ts = r["created_at"]
-                name    = r.get("note") or "Unknown"
+                new_ts = r["created_at"]
+                name   = r.get("note") or "Unknown"
                 details = r.get("details") or ""
-                embed = discord.Embed(title="🔑 New Activation", color=0x2ecc71,
-                    description=f"**User:** {name}\n**Details:** {details}")
-                await ch.send(embed=embed)
 
-            # Persist high-water mark so restarts don't re-fire old events
-            if rows:
+                # Post to channel if configured — prefer dedicated activation channel
+                act_ch_id = DISCORD_ACTIVATION_CHANNEL_ID or DISCORD_CHANNEL_ID
+                if act_ch_id != 0:
+                    ch = bot.get_channel(act_ch_id)
+                    if ch:
+                        embed = discord.Embed(title="🔑 New Activation", color=0x2ecc71,
+                            description=f"**User:** {name}\n**Details:** {details}")
+                        await ch.send(embed=embed)
+
+                # DM the user their code if we have their Discord ID
+                if r.get("discord_id") and r.get("code"):
+                    try:
+                        user = await bot.fetch_user(int(r["discord_id"]))
+                        cur.execute("SELECT expires_at FROM licenses WHERE code=%s", (r["code"],))
+                        exp_row = cur.fetchone()
+                        exp_str = (exp_row["expires_at"][:10] if exp_row and exp_row.get("expires_at") else "Lifetime")
+                        await _dm_code(user, r["code"], exp_str, name)
+                    except Exception:
+                        pass
+
+            # Always advance the mark so the next run doesn't re-check old events
+            if new_ts != last_ts:
                 cur.execute("""INSERT INTO bot_state(key, value) VALUES('last_activation_ts', %s)
-                               ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value""", (last_ts,))
+                               ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value""", (new_ts,))
         finally:
             conn.close()
 
